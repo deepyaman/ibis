@@ -56,7 +56,7 @@ class Backend(BaseBackend, CanCreateDatabase):
         self._table_env = table_env
 
     def _exec_sql(self, query: str) -> None:
-        self._table_env.execute_sql(query)
+        return self._table_env.execute_sql(query)
 
     def list_databases(self, like: str | None = None) -> list[str]:
         databases = self._table_env.list_databases()
