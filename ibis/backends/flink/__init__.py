@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+import pandas as pd
 import pyflink.version
 import sqlglot as sg
 from pyflink.table.types import create_arrow_schema
@@ -10,6 +11,7 @@ from pyflink.table.types import create_arrow_schema
 import ibis.common.exceptions as exc
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
+import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend, CanCreateDatabase
 from ibis.backends.base.sql.ddl import fully_qualified_re, is_fully_qualified
 from ibis.backends.flink.compiler.core import FlinkCompiler
@@ -18,16 +20,16 @@ from ibis.backends.flink.ddl import (
     CreateTableFromConnector,
     DropDatabase,
     DropTable,
+    InsertSelect,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    import pandas as pd
     import pyarrow as pa
     from pyflink.table import TableEnvironment
+    from pyflink.table.table_result import TableResult
 
-    import ibis.expr.types as ir
     from ibis.expr.streaming import Watermark
 
 
@@ -55,7 +57,7 @@ class Backend(BaseBackend, CanCreateDatabase):
         """
         self._table_env = table_env
 
-    def _exec_sql(self, query: str) -> None:
+    def _exec_sql(self, query: str) -> TableResult:
         return self._table_env.execute_sql(query)
 
     def list_databases(self, like: str | None = None) -> list[str]:
@@ -442,3 +444,67 @@ class Backend(BaseBackend, CanCreateDatabase):
     @classmethod
     def has_operation(cls, operation: type[ops.Value]) -> bool:
         return operation in cls._get_operations()
+
+    def insert(
+        self,
+        table_name: str,
+        obj: pd.DataFrame | ir.Table | list | dict,
+        database: str | None = None,
+        catalog: str | None = None,
+        overwrite: bool = False,
+    ) -> TableResult:
+        """Insert data into a table.
+
+        Parameters
+        ----------
+        table_name
+            The name of the table to which data needs will be inserted
+        obj
+            The source data or expression to insert
+        database
+            Name of the attached database that the table is located in.
+        catalog
+            Name of the attached catalog that the table is located in.
+        overwrite
+            If `True` then replace existing contents of table
+
+        Returns
+        -------
+        TableResult
+            The table result.
+
+        Raises
+        ------
+        ValueError
+            If the type of `obj` isn't supported
+        """
+
+        if isinstance(obj, ir.Table):
+            expr = obj
+            ast = self.compiler.to_ast(expr)
+            select = ast.queries[0]
+            statement = InsertSelect(
+                table_name,
+                select,
+                database=database,
+                catalog=catalog,
+                overwrite=overwrite,
+            )
+            return self._exec_sql(statement.compile())
+
+        if isinstance(obj, pd.DataFrame):
+            table = self._table_env.from_pandas(obj)
+            return table.execute_insert(table_name, overwrite=overwrite)
+
+        if isinstance(obj, dict):
+            obj = list(obj.items())
+        if isinstance(obj, list):
+            # pyflink infers datatypes, which may sometimes result in incompatible types
+            table = self._table_env.from_elements(obj)
+            return table.execute_insert(table_name, overwrite=overwrite)
+
+        raise ValueError(
+            "No operation is being performed. Either the obj parameter "
+            "is not a pandas DataFrame or is not a ibis Table."
+            f"The given obj is of type {type(obj).__name__} ."
+        )
