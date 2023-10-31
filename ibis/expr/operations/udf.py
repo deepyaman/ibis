@@ -187,6 +187,7 @@ class scalar(_UDF):
 
         Examples
         --------
+        ```pycon
         >>> import ibis
         >>> @ibis.udf.scalar.builtin
         ... def hamming(a: str, b: str) -> int:
@@ -195,6 +196,7 @@ class scalar(_UDF):
         >>> con = ibis.connect("duckdb://")
         >>> con.execute(expr)
         1
+        ```
         """
         return _wrap(
             cls._make_wrapper,
@@ -260,6 +262,7 @@ class scalar(_UDF):
 
         Examples
         --------
+        ```pycon
         >>> import ibis
         >>> @ibis.udf.scalar.python
         ... def add_one(x: int) -> int:
@@ -268,6 +271,7 @@ class scalar(_UDF):
         >>> con = ibis.connect("duckdb://")
         >>> con.execute(expr)
         3
+        ```
 
         See Also
         --------
@@ -325,7 +329,7 @@ class scalar(_UDF):
 
         Examples
         --------
-        ```python
+        ```pycon
         >>> import ibis
         >>> @ibis.udf.scalar.pandas
         ... def add_one(x: int) -> int:
@@ -392,6 +396,7 @@ class scalar(_UDF):
 
         Examples
         --------
+        ```pycon
         >>> import ibis
         >>> import pyarrow.compute as pc
         >>> @ibis.udf.scalar.pyarrow
@@ -401,6 +406,7 @@ class scalar(_UDF):
         >>> con = ibis.connect("duckdb://")
         >>> con.execute(expr)
         3
+        ```
 
         See Also
         --------
@@ -464,6 +470,7 @@ class agg(_UDF):
 
         Examples
         --------
+        ```pycon
         >>> import ibis
         >>> ibis.options.interactive = True
         >>> @ibis.udf.agg.builtin
@@ -473,6 +480,7 @@ class agg(_UDF):
         >>> expr = favg(t.bill_length_mm)
         >>> expr
         43.9219298245614
+        ```
         """
         return _wrap(
             cls._make_wrapper,
