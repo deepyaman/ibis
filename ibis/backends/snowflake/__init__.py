@@ -456,7 +456,10 @@ $$ {defn["source"]} $$"""
         limit: int | str | None = None,
         **kwargs: Any,
     ) -> pa.Table:
-        from ibis.backends.snowflake.converter import SnowflakePyArrowData
+        from ibis.backends.snowflake.converter import (
+            SnowflakePyArrowData,
+            storage_schema,
+        )
 
         self._run_pre_execute_hooks(expr)
 
@@ -466,7 +469,13 @@ $$ {defn["source"]} $$"""
 
         ibis_schema = expr.as_table().schema()
         if res is None:
-            res = ibis_schema.to_pyarrow().empty_table()
+            # the connector returns None rather than an empty table for a
+            # zero-row result, so stand in for it with the schema snowflake
+            # would have sent: JSON-encoded columns as strings, not as the
+            # native nested types they'd otherwise map to
+            res = storage_schema(
+                SnowflakePyArrowData.convert_schema(ibis_schema)
+            ).empty_table()
         else:
             # snowflake can rewrite the aliases we asked for server-side, for
             # example when QUOTED_IDENTIFIERS_IGNORE_CASE is enabled, so align
@@ -583,9 +592,22 @@ $$ {defn["source"]} $$"""
             # and structs back as JSON strings, so write that storage directly
             # rather than failing outright.
             schema = storage_schema(batch_reader.schema)
+            # `RecordBatch.cast` would be the obvious way to do this, but it
+            # only exists in pyarrow >= 16 and we support >= 10
+            unwrap = not schema.equals(batch_reader.schema)
             with pcsv.CSVWriter(path, schema, **kwargs) as writer:
                 for batch in batch_reader:
-                    writer.write_batch(batch.cast(schema))
+                    if unwrap:
+                        batch = pa.RecordBatch.from_arrays(
+                            [
+                                column.storage
+                                if isinstance(column.type, pa.ExtensionType)
+                                else column
+                                for column in batch.columns
+                            ],
+                            schema=schema,
+                        )
+                    writer.write_batch(batch)
 
     def get_schema(
         self,

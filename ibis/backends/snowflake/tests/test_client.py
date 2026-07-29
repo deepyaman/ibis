@@ -448,7 +448,14 @@ def test_nested_types_agree_across_arrow_paths(con):
 
     raw = {"a": [1, 2, 3], "b": "456"}
     lit = ibis.struct(raw).cast("struct<a: array<int>, b: json>")
-    t = con.tables.functional_alltypes.mutate(lit=lit).limit(5).select("id", "lit")
+    # `limit` without `order_by` is not a stable sample, and the two calls
+    # below issue two independent queries
+    t = (
+        con.tables.functional_alltypes.mutate(lit=lit)
+        .order_by("id")
+        .limit(5)
+        .select("id", "lit")
+    )
 
     # snowflake hands nested values back as JSON strings, so they're wrapped in
     # the `ibis.json` extension type rather than cast to a native arrow type
@@ -462,13 +469,35 @@ def test_nested_types_agree_across_arrow_paths(con):
     assert batched.to_pylist() == expected.to_pylist()
 
 
+def test_nested_types_empty_result(con):
+    # the connector returns None from `fetch_arrow_all` for a zero-row result;
+    # standing in for it with the natively-typed empty table would blow up when
+    # the JSON extension wrapping is applied
+    lit = ibis.struct({"a": [1, 2, 3]}).cast("struct<a: array<int>>")
+    t = con.tables.functional_alltypes.mutate(lit=lit).limit(0).select("id", "lit")
+
+    eager = con.to_pyarrow(t)
+    assert len(eager) == 0
+
+    with con.to_pyarrow_batches(t) as reader:
+        batched = reader.read_all()
+
+    assert len(batched) == 0
+    assert eager.schema.equals(batched.schema)
+
+
 def test_to_csv_nested_types(con, tmp_path):
     # CSV can't represent nested types at all -- pyarrow's writer rejects
     # list/map/struct outright -- so write the JSON strings snowflake sent
     lit = ibis.struct({"a": [1, 2, 3], "b": "456"}).cast(
         "struct<a: array<int>, b: json>"
     )
-    t = con.tables.functional_alltypes.mutate(lit=lit).limit(1).select("id", "lit")
+    t = (
+        con.tables.functional_alltypes.mutate(lit=lit)
+        .order_by("id")
+        .limit(1)
+        .select("id", "lit")
+    )
 
     out = tmp_path / "nested.csv"
     con.to_csv(t, out)
@@ -501,10 +530,17 @@ def test_mixed_case_columns_ignore_case(ignore_case_con):
 
     names = list(expected.columns)
 
-    assert ignore_case_con.to_pyarrow(t).column_names == names
+    arrow = ignore_case_con.to_pyarrow(t)
+    assert arrow.column_names == names
+    tm.assert_frame_equal(arrow.to_pandas(), expected)
 
+    # `reader.schema` is computed client-side before the query runs, so it
+    # proves nothing on its own -- drain the reader to exercise the server round
+    # trip that actually does the folding
     with ignore_case_con.to_pyarrow_batches(t) as reader:
-        assert reader.schema.names == names
+        batched = reader.read_all()
+    assert batched.column_names == names
+    tm.assert_frame_equal(batched.to_pandas(), expected)
 
     tm.assert_frame_equal(ignore_case_con.to_pandas(t), expected)
 
