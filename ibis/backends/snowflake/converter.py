@@ -46,6 +46,11 @@ PYARROW_JSON_TYPE = JSONType()
 pa.register_extension_type(PYARROW_JSON_TYPE)
 
 
+def _is_json_encoded(dtype: dt.DataType) -> bool:
+    """Return whether snowflake hands back `dtype` as a JSON-encoded string."""
+    return dtype.is_json() or dtype.is_array() or dtype.is_map() or dtype.is_struct()
+
+
 try:
     from ibis.formats.pandas import PandasData
 except ModuleNotFoundError:
@@ -87,12 +92,34 @@ else:
 
 
 try:
-    from ibis.formats.pyarrow import PyArrowData
+    from ibis.formats.pyarrow import PyArrowData, PyArrowType
 except ModuleNotFoundError:
     pass
 else:
 
     class SnowflakePyArrowData(PyArrowData):
+        @classmethod
+        def convert_schema(cls, schema: Schema) -> pa.Schema:
+            """Return the pyarrow schema that `convert_table` produces for `schema`.
+
+            Identical to `PyArrowSchema.from_ibis` except that JSON-encoded
+            columns keep the `ibis.json` extension type that `convert_column`
+            wraps them in, instead of the type they'd have if snowflake handed
+            them back natively.
+            """
+            return pa.schema(
+                [
+                    pa.field(
+                        name,
+                        PYARROW_JSON_TYPE
+                        if _is_json_encoded(dtype)
+                        else PyArrowType.from_ibis(dtype),
+                        nullable=dtype.nullable,
+                    )
+                    for name, dtype in schema.items()
+                ]
+            )
+
         @classmethod
         def convert_table(cls, table: pa.Table, schema: Schema) -> pa.Table:
             columns = [
@@ -110,12 +137,7 @@ else:
 
         @classmethod
         def convert_column(cls, column: pa.Array, dtype: dt.DataType) -> pa.Array:
-            if (
-                dtype.is_json()
-                or dtype.is_array()
-                or dtype.is_map()
-                or dtype.is_struct()
-            ):
+            if _is_json_encoded(dtype):
                 if isinstance(column, pa.ChunkedArray):
                     column = column.combine_chunks()
 
@@ -124,11 +146,6 @@ else:
 
         @classmethod
         def convert_scalar(cls, scalar: pa.Scalar, dtype: dt.DataType) -> pa.Scalar:
-            if (
-                dtype.is_json()
-                or dtype.is_array()
-                or dtype.is_map()
-                or dtype.is_struct()
-            ):
+            if _is_json_encoded(dtype):
                 return pa.ExtensionScalar.from_storage(PYARROW_JSON_TYPE, scalar)
             return super().convert_scalar(scalar, dtype)

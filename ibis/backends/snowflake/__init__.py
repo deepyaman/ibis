@@ -515,25 +515,29 @@ $$ {defn["source"]} $$"""
         chunk_size: int = 1_000_000,
         **kwargs: Any,
     ) -> pa.ipc.RecordBatchReader:
+        from ibis.backends.snowflake.converter import SnowflakePyArrowData
+
         self._run_pre_execute_hooks(expr)
         sql = self.compile(expr, limit=limit, params=params, **kwargs)
-        target_schema = expr.as_table().schema().to_pyarrow()
+        ibis_schema = expr.as_table().schema()
 
         return pa.ipc.RecordBatchReader.from_batches(
-            target_schema,
-            self._make_batch_iter(
-                sql, target_schema=target_schema, chunk_size=chunk_size
-            ),
+            SnowflakePyArrowData.convert_schema(ibis_schema),
+            self._make_batch_iter(sql, ibis_schema=ibis_schema, chunk_size=chunk_size),
         )
 
     def _make_batch_iter(
-        self, sql: str, *, target_schema: sch.Schema, chunk_size: int
+        self, sql: str, *, ibis_schema: sch.Schema, chunk_size: int
     ) -> Iterator[pa.RecordBatch]:
+        from ibis.backends.snowflake.converter import SnowflakePyArrowData
+
         with self._safe_raw_sql(sql) as cur:
             yield from itertools.chain.from_iterable(
-                t.rename_columns(target_schema.names)
-                .cast(target_schema)
-                .to_batches(max_chunksize=chunk_size)
+                SnowflakePyArrowData.convert_table(
+                    # see the comment in `to_pyarrow` about positional alignment
+                    t.rename_columns(list(ibis_schema.names)),
+                    ibis_schema,
+                ).to_batches(max_chunksize=chunk_size)
                 for t in cur.fetch_arrow_batches()
             )
 

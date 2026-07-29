@@ -442,6 +442,25 @@ def test_insert_dict_variants(con):
     assert len(t.execute()) == 4
 
 
+def test_nested_types_agree_across_arrow_paths(con):
+    from ibis.backends.snowflake.converter import PYARROW_JSON_TYPE
+
+    raw = {"a": [1, 2, 3], "b": "456"}
+    lit = ibis.struct(raw).cast("struct<a: array<int>, b: json>")
+    t = con.tables.functional_alltypes.mutate(lit=lit).limit(5).select("id", "lit")
+
+    # snowflake hands nested values back as JSON strings, so they're wrapped in
+    # the `ibis.json` extension type rather than cast to a native arrow type
+    expected = con.to_pyarrow(t)
+    assert expected.schema.field("lit").type == PYARROW_JSON_TYPE
+
+    with con.to_pyarrow_batches(t) as reader:
+        assert reader.schema.equals(expected.schema)
+        batched = pa.Table.from_batches(reader, schema=expected.schema)
+
+    assert batched.to_pylist() == expected.to_pylist()
+
+
 @pytest.fixture(scope="session")
 def ignore_case_con():
     # a dedicated connection, because `_setup_session` mutates the session
