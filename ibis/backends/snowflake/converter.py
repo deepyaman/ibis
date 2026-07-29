@@ -51,6 +51,23 @@ def _is_json_encoded(dtype: dt.DataType) -> bool:
     return dtype.is_json() or dtype.is_array() or dtype.is_map() or dtype.is_struct()
 
 
+def storage_schema(schema: pa.Schema) -> pa.Schema:
+    """Replace every extension field in `schema` with its storage type.
+
+    For JSON-encoded columns that unwraps `ibis.json` back to the string
+    snowflake actually sent, which is what formats that can't represent
+    extension types -- CSV in particular -- need to write.
+    """
+    return pa.schema(
+        [
+            field.with_type(field.type.storage_type)
+            if isinstance(field.type, pa.ExtensionType)
+            else field
+            for field in schema
+        ]
+    )
+
+
 try:
     from ibis.formats.pandas import PandasData
 except ModuleNotFoundError:

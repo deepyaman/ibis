@@ -9,6 +9,7 @@ import hypothesis.strategies as st
 import pandas as pd
 import pandas.testing as tm
 import pyarrow as pa
+import pyarrow.csv as pcsv
 import pytest
 import sqlglot as sg
 import sqlglot.expressions as sge
@@ -459,6 +460,28 @@ def test_nested_types_agree_across_arrow_paths(con):
         batched = pa.Table.from_batches(reader, schema=expected.schema)
 
     assert batched.to_pylist() == expected.to_pylist()
+
+
+def test_to_csv_nested_types(con, tmp_path):
+    # CSV can't represent nested types at all -- pyarrow's writer rejects
+    # list/map/struct outright -- so write the JSON strings snowflake sent
+    lit = ibis.struct({"a": [1, 2, 3], "b": "456"}).cast(
+        "struct<a: array<int>, b: json>"
+    )
+    t = con.tables.functional_alltypes.mutate(lit=lit).limit(1).select("id", "lit")
+
+    out = tmp_path / "nested.csv"
+    con.to_csv(t, out)
+
+    text = out.read_text()
+    assert "lit" in text
+    # the struct survives as JSON, not as an arrow struct or a repr
+    assert '"a"' in text and '"b"' in text
+
+    # and it's real CSV: pyarrow can read it back
+    reread = pcsv.read_csv(out)
+    assert reread.column_names == ["id", "lit"]
+    assert json.loads(reread["lit"][0].as_py()) == {"a": [1, 2, 3], "b": "456"}
 
 
 @pytest.fixture(scope="session")

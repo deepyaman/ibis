@@ -541,6 +541,52 @@ $$ {defn["source"]} $$"""
                 for t in cur.fetch_arrow_batches()
             )
 
+    def to_csv(
+        self,
+        expr: ir.Table,
+        /,
+        path: str | Path,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Write the results of executing the given expression to a CSV file.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        JSON, array, map and struct columns are written as the JSON strings
+        snowflake returns them as, because CSV has no way to represent them
+        otherwise.
+
+        Parameters
+        ----------
+        expr
+            The ibis expression to execute and persist to CSV.
+        path
+            The data source. A string or Path to the CSV file.
+        params
+            Mapping of scalar parameter expressions to value.
+        kwargs
+            Additional keyword arguments passed to pyarrow.csv.CSVWriter
+
+        https://arrow.apache.org/docs/python/generated/pyarrow.csv.CSVWriter.html
+        """
+        from ibis.backends.snowflake.converter import storage_schema
+
+        self._import_pyarrow()
+        import pyarrow.csv as pcsv
+
+        with expr.to_pyarrow_batches(params=params) as batch_reader:
+            # pyarrow's CSV writer refuses extension types, and can't write
+            # native nested types either. snowflake hands JSON, arrays, maps
+            # and structs back as JSON strings, so write that storage directly
+            # rather than failing outright.
+            schema = storage_schema(batch_reader.schema)
+            with pcsv.CSVWriter(path, schema, **kwargs) as writer:
+                for batch in batch_reader:
+                    writer.write_batch(batch.cast(schema))
+
     def get_schema(
         self,
         table_name: str,
