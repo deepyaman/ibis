@@ -14,17 +14,20 @@ call = ibis.table(
         "call_attempts": "int64",
     },
 )
-joinchain = employee.left_join(
-    call, [(employee.id == call.employee_id), ibis.literal(True)]
-).select(
-    employee.first_name,
-    employee.last_name,
-    employee.id,
-    call.start_time,
-    call.end_time,
-    call.employee_id,
-    call.call_outcome_id,
-    call.call_attempts,
+joinchain = (
+    employee.select(employee.id)
+    .left_join(
+        call.select(call.employee_id, call.call_attempts),
+        (
+            employee.select(employee.id).id
+            == call.select(call.employee_id, call.call_attempts).employee_id
+        ),
+    )
+    .select(
+        employee.select(employee.id).id,
+        call.select(call.employee_id, call.call_attempts).employee_id,
+        call.select(call.employee_id, call.call_attempts).call_attempts,
+    )
 )
 
 result = joinchain.aggregate(

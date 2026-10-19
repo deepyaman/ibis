@@ -13,9 +13,9 @@ from ibis.formats.pandas import PandasData
 
 tpch_catalog = {
     "lineitem": {
-        "l_orderkey": "int32",
-        "l_partkey": "int32",
-        "l_suppkey": "int32",
+        "l_orderkey": "int64",
+        "l_partkey": "int64",
+        "l_suppkey": "int64",
         "l_linenumber": "int32",
         "l_quantity": "decimal(15, 2)",
         "l_extendedprice": "decimal(15, 2)",
@@ -30,27 +30,61 @@ tpch_catalog = {
         "l_shipmode": "string",
         "l_comment": "string",
     },
-    "customer": [
-        ("c_custkey", "int64"),
-        ("c_name", "string"),
-        ("c_address", "string"),
-        ("c_nationkey", "int16"),
-        ("c_phone", "string"),
-        ("c_acctbal", "decimal"),
-        ("c_mktsegment", "string"),
-        ("c_comment", "string"),
-    ],
-    "orders": [
-        ("o_orderkey", "int64"),
-        ("o_custkey", "int64"),
-        ("o_orderstatus", "string"),
-        ("o_totalprice", "decimal(12,2)"),
-        ("o_orderdate", "date"),
-        ("o_orderpriority", "string"),
-        ("o_clerk", "string"),
-        ("o_shippriority", "int32"),
-        ("o_comment", "string"),
-    ],
+    "customer": {
+        "c_custkey": "int64",
+        "c_name": "string",
+        "c_address": "string",
+        "c_nationkey": "int32",
+        "c_phone": "string",
+        "c_acctbal": "decimal(15, 2)",
+        "c_mktsegment": "string",
+        "c_comment": "string",
+    },
+    "orders": {
+        "o_orderkey": "int64",
+        "o_custkey": "int64",
+        "o_orderstatus": "string",
+        "o_totalprice": "decimal(15, 2)",
+        "o_orderdate": "date",
+        "o_orderpriority": "string",
+        "o_clerk": "string",
+        "o_shippriority": "int32",
+        "o_comment": "string",
+    },
+    "part": {
+        "p_partkey": "int64",
+        "p_name": "string",
+        "p_mfgr": "string",
+        "p_brand": "string",
+        "p_type": "string",
+        "p_size": "int32",
+        "p_container": "string",
+        "p_retailprice": "decimal(15, 2)",
+        "p_comment": "string",
+    },
+    "partsupp": {
+        "ps_partkey": "int64",
+        "ps_suppkey": "int64",
+        "ps_availqty": "int32",
+        "ps_supplycost": "decimal(15, 2)",
+        "ps_comment": "string",
+    },
+    "supplier": {
+        "s_suppkey": "int64",
+        "s_name": "string",
+        "s_address": "string",
+        "s_nationkey": "int32",
+        "s_phone": "string",
+        "s_acctbal": "decimal(15, 2)",
+        "s_comment": "string",
+    },
+    "nation": {
+        "n_nationkey": "int32",
+        "n_name": "string",
+        "n_regionkey": "int32",
+        "n_comment": "string",
+    },
+    "region": {"r_regionkey": "int32", "r_name": "string", "r_comment": "string"},
 }
 
 root = Path(__file__).absolute().parents[3]
@@ -97,5 +131,22 @@ def test_parse_sql_tpch(tpch_query, snapshot, con):
     expected_df.columns = result_df.columns
 
     expected_df = PandasData.convert_table(expected_df, module.result.schema())
+
+    compare_tpc_results(result_df, expected_df)
+
+
+@pytest.mark.parametrize("tpch_query", range(1, 23), ids=lambda q: f"tpch{q:02d}")
+def test_parse_sql_tpch_results(tpch_query, con):
+    """Every TPC-H query parses into an expression that computes the same result."""
+    sql = (SQL_QUERY_PATH / f"{tpch_query:02d}.sql").read_text()
+
+    expr = ibis.parse_sql(sql, tpch_catalog, dialect="duckdb")
+
+    with set_database(con, "tpch"):
+        expected_df = con.con.execute(sql).df()
+        result_df = con.to_pandas(expr)
+
+    expected_df.columns = result_df.columns
+    expected_df = PandasData.convert_table(expected_df, expr.schema())
 
     compare_tpc_results(result_df, expected_df)

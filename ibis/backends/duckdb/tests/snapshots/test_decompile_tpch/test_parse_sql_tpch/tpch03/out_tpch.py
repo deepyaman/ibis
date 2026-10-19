@@ -6,21 +6,20 @@ customer = ibis.table(
         "c_custkey": "int64",
         "c_name": "string",
         "c_address": "string",
-        "c_nationkey": "int16",
+        "c_nationkey": "int32",
         "c_phone": "string",
-        "c_acctbal": "decimal",
+        "c_acctbal": "decimal(15, 2)",
         "c_mktsegment": "string",
         "c_comment": "string",
     },
 )
-lit = ibis.literal(True)
 orders = ibis.table(
     name="orders",
     schema={
         "o_orderkey": "int64",
         "o_custkey": "int64",
         "o_orderstatus": "string",
-        "o_totalprice": "decimal(12, 2)",
+        "o_totalprice": "decimal(15, 2)",
         "o_orderdate": "date",
         "o_orderpriority": "string",
         "o_clerk": "string",
@@ -31,9 +30,9 @@ orders = ibis.table(
 lineitem = ibis.table(
     name="lineitem",
     schema={
-        "l_orderkey": "int32",
-        "l_partkey": "int32",
-        "l_suppkey": "int32",
+        "l_orderkey": "int64",
+        "l_partkey": "int64",
+        "l_suppkey": "int64",
         "l_linenumber": "int32",
         "l_quantity": "decimal(15, 2)",
         "l_extendedprice": "decimal(15, 2)",
@@ -50,55 +49,63 @@ lineitem = ibis.table(
     },
 )
 cast = ibis.literal("1995-03-15").cast("date")
+f = customer.filter((customer.c_mktsegment == "BUILDING"))
+f1 = orders.filter((orders.o_orderdate < cast))
+f2 = lineitem.filter((lineitem.l_shipdate > cast))
 joinchain = (
-    customer.inner_join(
-        orders,
-        [(customer.c_custkey == orders.o_custkey), lit, (orders.o_orderdate < cast)],
+    f.select(f.c_custkey, f.c_mktsegment)
+    .inner_join(
+        f1.select(f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority),
+        (
+            f.select(f.c_custkey, f.c_mktsegment).c_custkey
+            == f1.select(
+                f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority
+            ).o_custkey
+        ),
     )
     .inner_join(
-        lineitem,
-        [(orders.o_orderkey == lineitem.l_orderkey), lit, (lineitem.l_shipdate > cast)],
+        f2.select(f2.l_orderkey, f2.l_extendedprice, f2.l_discount, f2.l_shipdate),
+        (
+            f1.select(
+                f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority
+            ).o_orderkey
+            == f2.select(
+                f2.l_orderkey, f2.l_extendedprice, f2.l_discount, f2.l_shipdate
+            ).l_orderkey
+        ),
     )
     .select(
-        customer.c_custkey,
-        customer.c_name,
-        customer.c_address,
-        customer.c_nationkey,
-        customer.c_phone,
-        customer.c_acctbal,
-        customer.c_mktsegment,
-        customer.c_comment,
-        orders.o_orderkey,
-        orders.o_custkey,
-        orders.o_orderstatus,
-        orders.o_totalprice,
-        orders.o_orderdate,
-        orders.o_orderpriority,
-        orders.o_clerk,
-        orders.o_shippriority,
-        orders.o_comment,
-        lineitem.l_orderkey,
-        lineitem.l_partkey,
-        lineitem.l_suppkey,
-        lineitem.l_linenumber,
-        lineitem.l_quantity,
-        lineitem.l_extendedprice,
-        lineitem.l_discount,
-        lineitem.l_tax,
-        lineitem.l_returnflag,
-        lineitem.l_linestatus,
-        lineitem.l_shipdate,
-        lineitem.l_commitdate,
-        lineitem.l_receiptdate,
-        lineitem.l_shipinstruct,
-        lineitem.l_shipmode,
-        lineitem.l_comment,
+        f.select(f.c_custkey, f.c_mktsegment).c_custkey,
+        f.select(f.c_custkey, f.c_mktsegment).c_mktsegment,
+        f1.select(
+            f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority
+        ).o_orderkey,
+        f1.select(
+            f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority
+        ).o_custkey,
+        f1.select(
+            f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority
+        ).o_orderdate,
+        f1.select(
+            f1.o_orderkey, f1.o_custkey, f1.o_orderdate, f1.o_shippriority
+        ).o_shippriority,
+        f2.select(
+            f2.l_orderkey, f2.l_extendedprice, f2.l_discount, f2.l_shipdate
+        ).l_orderkey,
+        f2.select(
+            f2.l_orderkey, f2.l_extendedprice, f2.l_discount, f2.l_shipdate
+        ).l_extendedprice,
+        f2.select(
+            f2.l_orderkey, f2.l_extendedprice, f2.l_discount, f2.l_shipdate
+        ).l_discount,
+        f2.select(
+            f2.l_orderkey, f2.l_extendedprice, f2.l_discount, f2.l_shipdate
+        ).l_shipdate,
     )
 )
-f = joinchain.filter((joinchain.c_mktsegment == "BUILDING"))
-agg = f.aggregate(
-    [(f.l_extendedprice * ((1 - f.l_discount))).sum().name("revenue")],
-    by=[f.l_orderkey, f.o_orderdate, f.o_shippriority],
+agg = joinchain.aggregate(
+    [(joinchain.l_extendedprice * ((1 - joinchain.l_discount))).sum().name("revenue")],
+    by=[joinchain.l_orderkey, joinchain.o_orderdate, joinchain.o_shippriority],
 )
 s = agg.order_by(agg.revenue.desc(), agg.o_orderdate.asc(nulls_first=True))
 
