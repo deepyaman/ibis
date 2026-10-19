@@ -107,6 +107,6 @@ agg = joinchain.aggregate(
     [(joinchain.l_extendedprice * ((1 - joinchain.l_discount))).sum().name("revenue")],
     by=[joinchain.l_orderkey, joinchain.o_orderdate, joinchain.o_shippriority],
 )
-s = agg.order_by(agg.revenue.desc(), agg.o_orderdate.asc(nulls_first=True))
+p = agg.select(agg.l_orderkey, agg.revenue, agg.o_orderdate, agg.o_shippriority)
 
-result = s.select(s.l_orderkey, s.revenue, s.o_orderdate, s.o_shippriority).limit(10)
+result = p.order_by(p.revenue.desc(), p.o_orderdate.asc(nulls_first=True)).limit(10)

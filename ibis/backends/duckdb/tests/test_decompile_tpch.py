@@ -8,6 +8,7 @@ import pytest
 from pytest import param
 
 import ibis
+from ibis.backends.duckdb.tests.test_parse_sql import assert_same_rows
 from ibis.backends.tests.tpc.conftest import compare_tpc_results
 from ibis.formats.pandas import PandasData
 
@@ -90,6 +91,10 @@ tpch_catalog = {
 root = Path(__file__).absolute().parents[3]
 
 SQL_QUERY_PATH = root / "backends" / "tests" / "tpc" / "queries" / "duckdb" / "h"
+TPCDS_QUERY_PATH = root / "backends" / "tests" / "tpc" / "queries" / "duckdb" / "ds"
+
+# Ibis has no ROLLUP / GROUPING SETS
+TPCDS_ROLLUP_QUERIES = frozenset({5, 14, 18, 22, 67, 70, 77, 80, 86})
 
 
 @contextmanager
@@ -150,3 +155,30 @@ def test_parse_sql_tpch_results(tpch_query, con):
     expected_df = PandasData.convert_table(expected_df, expr.schema())
 
     compare_tpc_results(result_df, expected_df)
+
+
+@pytest.mark.parametrize(
+    "tpcds_query",
+    [
+        param(
+            q,
+            id=f"tpcds{q:02d}",
+            marks=[pytest.mark.xfail(reason="requires rollup")]
+            if q in TPCDS_ROLLUP_QUERIES
+            else [],
+        )
+        for q in range(1, 100)
+    ],
+)
+def test_parse_sql_tpcds_results(tpcds_query, con):
+    """Every TPC-DS query parses into an expression that computes the same result."""
+    sql = (TPCDS_QUERY_PATH / f"{tpcds_query:02d}.sql").read_text()
+
+    with set_database(con, "tpcds"):
+        catalog = {name: con.table(name).schema() for name in con.list_tables()}
+        expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
+        expected_df = con.con.execute(sql).df()
+        result_df = con.to_pandas(expr)
+
+    # SQL output names and (for ties) row order are free, values are not
+    assert_same_rows(result_df, expected_df)

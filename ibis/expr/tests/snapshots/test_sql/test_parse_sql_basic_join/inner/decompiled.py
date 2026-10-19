@@ -26,18 +26,8 @@ joinchain = (
         call.employee_id,
         call.call_outcome_id,
         call.call_attempts,
+        employee.filter((employee.id < 5)).first_name.name("first"),
     )
 )
-s = joinchain.order_by(joinchain.id.desc())
 
-result = s.select(
-    s.first_name,
-    s.last_name,
-    s.id,
-    s.start_time,
-    s.end_time,
-    s.employee_id,
-    s.call_outcome_id,
-    s.call_attempts,
-    s.first_name.name("first"),
-)
+result = joinchain.order_by(joinchain.id.desc())
