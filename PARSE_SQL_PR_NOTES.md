@@ -33,6 +33,8 @@ test environment (needs `ci/ibis-testing-data`).
 
 ## Architecture: why the planner stays
 
+> Superseded on 2026-10-20 by the AST converter; see "Phase A handoff" at the end.
+
 Before changing anything I measured the planner itself: it plans 22/22 TPC-H
 and 99/99 TPC-DS, and it preserves DISTINCT, HAVING, windows and set
 operations. Every silent-wrong case was a gap in the Ibis conversion code, not
@@ -55,6 +57,8 @@ Costs of the planner, all worked around in `ibis/expr/sql.py`:
 - The planner mistakes `x = (SELECT ...)` and `x = outer.y` for join keys.
 
 ## Optimizer rule set (`RULES`)
+
+> Superseded on 2026-10-20 by the AST converter; see "Phase A handoff" at the end.
 
 Dropped: `unnest_subqueries`, `merge_subqueries`, `eliminate_subqueries`
 (they decorrelate subqueries into joins against generated derived tables;
@@ -163,3 +167,84 @@ they change because the optimizer no longer merges subqueries.
 #9529 (convert SQL to Ibis code, the tracking issue), #9979 (TPC-H), #9267
 (COUNT(*)), #8597 (decompile returns SQL), #11810 (decompiler signatures),
 #9254 (closed, "use sqlglot's AST").
+
+## Phase A handoff: the AST converter (2026-10-20)
+
+**Status.** Commits `57ac91f24` (`fix(decompile)`: date arithmetic and TRY_CAST rendering) and
+`627a4db5d` (`feat(parse_sql): drop the planner, convert the AST`). `ibis/expr/sql.py` (1446 lines)
+no longer imports `sqlglot.planner`. Gate, from the worktree with the pixi python:
+
+    python -m pytest ibis/backends/duckdb/tests/test_parse_sql.py ibis/backends/duckdb/tests/test_decompile_tpch.py \
+      ibis/expr/tests/test_decompile.py ibis/expr/tests/test_rewrites.py ibis/expr/tests/test_sql.py \
+      -q --no-header -p no:cacheprovider
+
+504 passed, 18 xfailed (the nine TPC-DS ROLLUP queries, parse and roundtrip, `strict=True`,
+`raises=UnsupportedOperationError`). TPC-H 22/22 and TPC-DS 90/99 in both modes; 96 everyday queries
+in both modes; 15 unsupported-construct cases raise as intended; OFFSET passes with no xfail. The two
+claims above that the review refuted stand corrected: `pushdown_projections` was never needed, and the
+planner did lose information (OFFSET, DISTINCT ON, QUALIFY, derived-table projections, set-op sides).
+
+**Design** (the full write-up with the evidence for each rule is the plan file
+`~/.claude/plans/pasted-content-id-af53-read-parse-sql-r-foamy-sparrow.md`):
+
+- `RULES = (qualify, annotate_types, canonicalize)`, `optimize(..., isolate_tables=False)`. The
+  per-table `(SELECT ... FROM t) AS t` wrappers came from `optimize()`'s table isolation, not from
+  `pushdown_projections`. Measured on the three result suites, parse and roundtrip, 288 tests each:
+  (A) this set, (B) + `simplify`, (C) + `normalize` + `pushdown_predicates` + `simplify`,
+  (D) C + `pushdown_projections`: all four give 288 passed, 18 xfailed. The smallest set is kept.
+- One `Scope` per SELECT (`ibis/expr/sql.py`): FROM/JOIN aliases map to columns of the relation under
+  construction, which each clause replaces (table or chain, filtered relation, aggregate). A reference
+  to an enclosing SELECT's alias resolves through the parent scope to that relation's field, so
+  correlated subqueries, HAVING and ORDER BY all use the same lookup.
+- Joins: members are addressed through the chain's output names (`_map_member`); an inner-join key
+  dropped as equal to the same-named left column maps to that column. A WHERE conjunct that references
+  two or more aliases, all bound so far including the newly comma-joined one, and no subquery becomes
+  that link's join condition unless a later link is RIGHT/FULL (`_hoistable`). ON conjuncts holding a
+  subquery are filtered after the chain for inner joins and rejected for outer joins. `rname` is
+  `{name}_<alias>`.
+- Aggregates: every `AggFunc` that is not a window function (with any `FILTER`) becomes a named metric
+  before `aggregate`; GROUP BY expressions are named after the column or the matching select alias.
+  Later clauses find both through a node-keyed memo in `convert()`; a qualified column that is not a
+  group raises `IbisInputError`. `COUNT(*)` is `scope.rel.count()` on the relation being aggregated.
+- Correlated scalar subqueries anchor on a relation the compiler keeps aliased; when the clause's
+  relation is a Project/Filter/Sort/Distinct the converter `.view()`s it first (`_anchor`). EXISTS and
+  IN block select fusion on their own and need nothing. No gate query exercises the view rule;
+  `ibis/expr/tests/test_sql.py::test_correlated_scalar_subquery_over_a_derived_table_is_anchored` does.
+- Projection: identity projections are elided; a plain projection on an unfinished join uses
+  `Join.select`, anything with a window, aggregate or subquery projects on the finished table. ORDER BY
+  keys that the projection does not carry fall back to an extended projection that is sorted and then
+  narrowed. Set operations and CTEs as before, with `with_`/`from_` absorbed for sqlglot < 28 and
+  `SetOperation` for < 26.
+
+**Phase B** (mechanical, test-gated; the plan's section 9):
+
+- B1 value layer: done in `627a4db5d`: NULL comparisons and arithmetic, TRY_CAST, `= ANY` / `<> ALL`,
+  `FILTER (WHERE)`, named windows, parenthesised ORDER BY keys. Left from the review's list: EXTRACT
+  units other than the ones that map to a method (`dow`, `doy`, `epoch`), `IS DISTINCT FROM`,
+  STRING_AGG, BOOL_OR/BOOL_AND, `//`, DATE_DIFF, CURRENT_DATE, EXP/LOG, POSITION, SPLIT_PART,
+  REGEXP_MATCHES, DATE_PART, CONCAT's NULL semantics per dialect, SUBSTRING with a non-positive start,
+  ORDER BY on a FROM-less SELECT (currently ignored).
+- B2 errors: `_reject_unsupported` and `test_parse_sql_unsupported` exist; audit what else escapes as a
+  raw Ibis error (incomparable types, duplicate CTE names) and the wording.
+- B3 test hygiene: the comparator (compare in order under a top-level ORDER BY, compare names, no
+  blanket rounding; mark the decimal-mean queries against an issue for `ops.Mean`), move
+  `assert_same_rows`/`roundtrip` out of the test module, build the TPC-DS catalog once per session.
+- B4 hygiene: drop the `chore(sql)` notes commits before any PR; the review's PR order (simplify fix,
+  decompile rules, harness, converter); decide the sqlglot floor (`_arg`, `_SET_OPERATION` absorb the
+  renames; `Expression.walk(prune=)`, `sge.Filter`, `Join.method` must exist at the floor).
+- B5 Ibis issues to file, repros from this session: (1) `merge_select_select` drops the outer alias of
+  a correlated `ScalarSubquery`: `s = t.filter(t.a > 1).select(t.a); s.filter(s.a > u.filter(u.a ==
+  s.a).a.mean())` compiles to a dangling `t2`; (2) `ir.Join.select` skips the projection rewrite:
+  `t.join(u, t.a == u.a).select(t.a, r=ibis.row_number())` emits `ROW_NUMBER()` without `OVER`;
+  (3) `Table.aggregate(having=...)` can call the nonexistent `ibis.util.get_name`; (4) an int64 column
+  is "not comparable" to an int32 scalar subquery; (5) `ops.Mean` of `decimal(p, s)` is typed
+  `decimal(p, s)` while engines return double.
+
+Anything that changes the Scope, anchor, aggregate-memo or hoisting rules, or a TPC-DS failure whose
+cause is not obvious, goes back to the planning model rather than being patched around.
+
+**Known deviations.** Unaliased output columns are `_col_N` and quoted aliases are lower-cased by
+sqlglot's `qualify`; every rescan of a table or CTE is a `.view()` (TPC-DS scans one table up to 15
+times); `parse_sql` without `dialect` parses `ORDER BY x` as NULLS FIRST (sqlglot's generic default),
+so pass the dialect; the `.select(<all columns>)` after each join in decompiled output is the
+decompiler rendering the chain's own values, not a projection the converter adds.
