@@ -21,9 +21,13 @@ execute the parsed expression, not by decompiler snapshots.
 | TPC-DS (99) | 34 (first measurement) | 90; the other 9 use ROLLUP, which Ibis cannot express |
 | everyday constructs (52) | 15 of the first 36 | 51; OFFSET is dropped by sqlglot < 30's planner |
 | silently wrong | 4 | 0 |
+| decompile and re-execute, TPC-H | 6 | 22 |
+| decompile and re-execute, TPC-DS | not measured | 90 (the ROLLUP 9 again) |
+| decompile and re-execute, everyday | not measured | 51 |
 
 Tests: `ibis/backends/duckdb/tests/test_decompile_tpch.py`
-(`test_parse_sql_tpch_results`, `test_parse_sql_tpcds_results`) and
+(`test_parse_sql_tpch_results`, `test_parse_sql_tpcds_results`, each with a
+`parse` and a `roundtrip` variant) and
 `ibis/backends/duckdb/tests/test_parse_sql.py`. Run with the DuckDB backend
 test environment (needs `ci/ibis-testing-data`).
 
@@ -96,14 +100,46 @@ everywhere; that is a decompiler bug, see follow-ups).
 - `concat()` is translated with `coalesce(arg, '')` per argument because
   CONCAT skips NULLs where `||` propagates them (DuckDB semantics).
 
+## Decompiler
+
+The decompiler is checked the same way: decompile the parsed expression, run
+the generated code, execute the rebuilt expression, compare rows. Unit tests
+in `ibis/expr/tests/test_decompile.py` additionally require the generated
+code to be a fixed point (decompiling the rebuilt expression gives the same
+text).
+
+Decisions, each with the query that forced it:
+
+- EXISTS renders as `(pred).any()`, the documented way to spell a correlated
+  EXISTS; it needs the predicate to span exactly the inner and outer table,
+  otherwise `(rel.count() > 0)` (TPC-H q04, q21, q22).
+- A relation joined through a `JoinReference` is always bound to a variable:
+  the reference is a pass-through, so its parent looked single-use and was
+  inlined into every predicate and projection of the chain (TPC-H q02 was
+  unreadable and raised).
+- `and`/`or` were rendered as Python keywords, which raise on an Ibis
+  expression; NOT rendered as `.not()`, a syntax error (q07, q12, q13, q19).
+- `simplify` (used only by the decompiler) moved filters below projections
+  that compute window functions, so the window saw filtered rows: TPC-DS
+  q51, q53, q63 and q89 silently returned different rows. It also collapsed
+  `table.select(all columns)` under a subquery into the bare table, which
+  subquery ops reject (q95).
+- A join link shared by two chains was bound to a variable, producing
+  `joinlink = .inner_join(...)` (TPC-DS q10).
+- Variable names come from op class names; `or`, `sum`, `not` are keywords or
+  builtins and get a trailing underscore (TPC-DS q88).
+
+Known rough edges: shared sub-expressions get class-name variables
+(`invalues`, `windowfunction`, `subtract`); `ibis.literal(...)` is spelled
+out for every list member of `isin`; `.name()` is used where `mutate(k=...)`
+would read better. All cosmetic. Issue #11810 (op vs method signature
+mismatch) remains the structural fix for the generic `value()` rule.
+
 ## Not done (follow-ups, in order)
 
-1. Decompiler: no rules for ExistsSubquery, ScalarSubquery, InSubquery, cross
-   joins, windows; and it inlines pushed-down `select`s instead of binding
-   them to a variable. Only 6/22 TPC-H expressions decompile-and-re-execute.
-   Issue #11810 (op vs method signature mismatch) is the structural fix.
-2. ROLLUP / GROUPING SETS: an Ibis expression-model gap, not a parser gap.
-3. Dialect functions beyond the ANSI-ish set in the tests.
+1. ROLLUP / GROUPING SETS: an Ibis expression-model gap, not a parser gap.
+2. Dialect functions beyond the ANSI-ish set in the tests.
+3. Decompiled code readability (see rough edges above).
 4. Docs: `parse_sql` is not in the API reference; `docs/_quarto.yml` has a
    TODO for `decompile` "once the API is not experimental".
 
@@ -116,7 +152,8 @@ everywhere; that is a decompiler bug, see follow-ups).
    model, with the TPC-H result test as the gate.
 3. Set operations, CTEs, windows, FULL joins, date arithmetic, with the TPC-DS
    result test and the everyday-SQL test.
-4. Decompiler work, separately.
+4. Decompiler: the `simplify` fix first (it is a correctness bug on its own),
+   then the rendering rules with the round-trip tests as the gate.
 
 Each step keeps the existing `ibis/expr/tests/test_sql.py` snapshots updated;
 they change because the optimizer no longer merges subqueries.
