@@ -314,3 +314,23 @@ join-chain rendering changed by the decompile commits); regenerate them in the d
 structurally equal to a metric (`SUM(a) AS s, SUM(a) OVER () ... GROUP BY a`) hits the memo and
 raises `IbisInputError` ("No reduction or analytic function ...") rather than translating; valid but
 rare SQL, left for the memo's owner.
+
+**Follow-ups after re-running the review's 184-query battery** (the review session's
+`scratchpad/review/adversarial.py` and `adversarial_rt.py`, strict comparator, no rounding):
+`1283a0e72` fix(parse_sql): truncate integer division like SQL (`a // b` was Ibis's floor; now
+`(a - a % b) // b`, exact for negative operands), `051539ec3` fix(parse_sql): let an uncorrelated
+EXISTS compile (a bare table under EXISTS is projected first; NATURAL/ASOF/POSITIONAL joins are
+rejected before `qualify` fails on their columns). Gate: 611 passed, 18 xfailed.
+
+| battery (184 queries) | ok | silently wrong | raise |
+|---|---|---|---|
+| main (planner, 2022 prototype) | 50 | 10 | 124 |
+| planner branch at review time | 143 | 5 | 36 (roundtrip 138 / 5 / 41) |
+| AST converter now | 176 | 1 | 7 (roundtrip 173 / 1 / 10) |
+
+The one wrong result is the decimal typing above (`AVG(CAST(c AS DECIMAL(10, 2)))` → 2.12 for
+2.125). The seven raises are deliberate `UnsupportedOperationError`s: DISTINCT ON, NATURAL JOIN,
+`SUM(DISTINCT x)`, `SUBSTRING` with start 0 and -1, `YEAR(d)` (follow-up 2, dialect functions),
+`> ALL (subquery)`. The three roundtrip-only raises are decompiler gaps the review already assigned
+to the decompile PR: `PERCENT_RANK()`/`CUME_DIST()` render with no arguments, a nested EXISTS trips
+the `.any()` unpack, `NULLIF` renders as `.null_if`.
