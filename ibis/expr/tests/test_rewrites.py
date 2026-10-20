@@ -29,6 +29,14 @@ def test_simplify_keeps_subquery_relation():
     assert simplify(expr.op()) == expr.op()
 
 
+def test_simplify_keeps_filter_with_subquery_predicate():
+    # the EXISTS is correlated to the filtered rows, not to the table
+    u = ibis.table({"int_col": "int64"}, name="u")
+    f = t.filter(t.int_col > 1)
+    expr = f.filter((u.int_col == f.int_col).any())
+    assert simplify(expr.op()) == expr.op()
+
+
 def test_simplify_full_reprojection():
     t1 = t.select(t)
     t1_opt = simplify(t1.op())

@@ -384,6 +384,11 @@ def subsequent_projects(_, y):
 
 @replace(p.Filter(y @ p.Filter))
 def subsequent_filters(_, y):
+    # a subquery in a predicate may be correlated to the inner filter's rows;
+    # merging would leave it referencing a relation the result no longer has
+    if any(v.find(p.Subquery, filter=p.Value) for v in _.predicates):
+        return _
+
     rule = p.Field(y, name) >> d.Field(y.parent, name)
     preds = tuple(v.replace(rule, filter=ops.Value) for v in _.predicates)
     return ops.Filter(y.parent, y.predicates + preds)
