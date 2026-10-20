@@ -7,6 +7,8 @@ import decimal
 import duckdb
 import pandas as pd
 import pytest
+import sqlglot
+from packaging.version import parse as vparse
 
 import ibis
 import ibis.common.exceptions as com
@@ -318,6 +320,56 @@ INVALID = {
 }
 
 
+# sqlglot releases before 27.11 have no ``Rank``, ``DenseRank``, ``PercentRank``,
+# ``CumeDist`` or ``Ntile`` class, and the oldest in the declared range parse
+# STRPOS, SPLIT_PART and LTRIM as anonymous functions and STRING_AGG without its
+# separator, cannot qualify SEMI and ANTI joins or ``* REPLACE``, and reject
+# ``LIMIT n%``, ``EXCLUDE``, ``BETWEEN SYMMETRIC``, ``INTERVAL`` without a unit
+# and ``COLLATE`` as syntax. ``parse_sql`` raises for all of them, so these
+# cases are skipped there: they fail at 23.6.3, the floor of the range, and
+# pass from 27.11; the boundary of each one was not bisected.
+OLD_SQLGLOT = vparse(sqlglot.__version__) < vparse("27.11")
+OLD_SQLGLOT_CASES = frozenset(
+    {
+        "ranking_empty_window",
+        "window_rank",
+        "window_ntile",
+        "rank_over_sum_group",
+        "semi",
+        "anti",
+        "string_agg",
+        "string_agg_group",
+        "position",
+        "split_part",
+        "trim_sides",
+        "star_exclude_replace",
+    }
+)
+OLD_SQLGLOT_UNSUPPORTED = frozenset(
+    {
+        "limit_percent",
+        "window_exclude",
+        "between_symmetric",
+        "interval_without_unit",
+        "collate",
+    }
+)
+
+
+def _params(table, skipped):
+    """Parametrize over ``table``, skipping ``skipped`` on old sqlglot."""
+    return [
+        pytest.param(
+            *(value if isinstance(value, tuple) else (value,)),
+            id=name,
+            marks=pytest.mark.skipif(
+                OLD_SQLGLOT and name in skipped, reason="needs sqlglot >= 27.11"
+            ),
+        )
+        for name, value in table.items()
+    ]
+
+
 def assert_matches_duckdb(duck, expr, sql):
     """Assert that ``expr`` computes what DuckDB computes for ``sql``."""
     ordered_sql, sort_keys = expose_sort_keys(sql, dialect="duckdb")
@@ -326,13 +378,13 @@ def assert_matches_duckdb(duck, expr, sql):
     assert_same_result(result, expected, sort_keys=sort_keys)
 
 
-@pytest.mark.parametrize("sql", list(CASES.values()), ids=list(CASES))
+@pytest.mark.parametrize("sql", _params(CASES, OLD_SQLGLOT_CASES))
 def test_parse_sql_matches_duckdb(duck, sql):
     expr = ibis.parse_sql(sql, CATALOG, dialect="duckdb")
     assert_matches_duckdb(duck, expr, sql)
 
 
-@pytest.mark.parametrize("sql", list(CASES.values()), ids=list(CASES))
+@pytest.mark.parametrize("sql", _params(CASES, OLD_SQLGLOT_CASES))
 def test_decompile_roundtrip_matches_duckdb(duck, sql):
     """Parsed SQL decompiles to Python that rebuilds an equivalent expression."""
     expr = decompile_roundtrip(ibis.parse_sql(sql, CATALOG, dialect="duckdb"))
@@ -340,7 +392,7 @@ def test_decompile_roundtrip_matches_duckdb(duck, sql):
 
 
 @pytest.mark.parametrize(
-    ("sql", "message"), list(UNSUPPORTED.values()), ids=list(UNSUPPORTED)
+    ("sql", "message"), _params(UNSUPPORTED, OLD_SQLGLOT_UNSUPPORTED)
 )
 def test_parse_sql_unsupported(sql, message):
     """SQL `parse_sql` cannot translate raises instead of dropping a clause."""

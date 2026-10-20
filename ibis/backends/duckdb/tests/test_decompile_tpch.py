@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import sqlglot
+from packaging.version import parse as vparse
 from pytest import param
 
 import ibis
@@ -94,6 +96,11 @@ TPCDS_QUERY_PATH = root / "backends" / "tests" / "tpc" / "queries" / "duckdb" / 
 
 # Ibis has no ROLLUP / GROUPING SETS; parse_sql rejects them up front
 TPCDS_ROLLUP_QUERIES = frozenset({5, 14, 18, 22, 67, 70, 77, 80, 86})
+
+# sqlglot has no ``Rank`` class before 27.11, so parse_sql rejects RANK() there;
+# these queries use it (67, 70 and 86 do too, behind the ROLLUP mark)
+OLD_SQLGLOT = vparse(sqlglot.__version__) < vparse("27.11")
+TPCDS_RANKING_QUERIES = frozenset({36, 44, 47, 49, 57})
 
 # Ibis types the mean of a decimal column and the product of two decimal columns
 # at the scale of the input, where DuckDB computes a double or a wider decimal,
@@ -196,7 +203,12 @@ def test_parse_sql_tpch_results(tpch_query, decompile, con):
                 )
             ]
             if q in TPCDS_ROLLUP_QUERIES
-            else [],
+            else [
+                pytest.mark.skipif(
+                    OLD_SQLGLOT and q in TPCDS_RANKING_QUERIES,
+                    reason="needs sqlglot >= 27.11",
+                )
+            ],
         )
         for q in range(1, 100)
     ],
