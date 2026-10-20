@@ -8,6 +8,7 @@ from ibis import _
 from ibis.expr.decompile import decompile
 
 t = ibis.table([("a", "int64"), ("b", "string")], name="t")
+u = ibis.table([("a", "int64"), ("c", "float64")], name="u")
 expr = t.a.sum()
 
 countries = ibis.table(
@@ -38,6 +39,37 @@ three = one + two
 nine = three**2
 
 nine_ = (two + one) ** 2
+
+total = t.a.sum()
+roundtrip_cases = {
+    "logical_operators": t.filter(((t.a > 1) & ~(t.b == "x")) | (t.a < -t.a)),
+    "isin_values": t.filter(t.a.isin([1, 2])),
+    "typed_literal": t.select(ibis.literal(1, "int8").name("x")),
+    "interval_literal": ibis.interval(1, "D"),
+    "exists": t.filter((u.a == t.a).any()),
+    "not_exists": t.filter(~((u.a == t.a) & (u.c > 1)).any()),
+    "in_subquery": t.filter(t.a.isin(u.a)),
+    "correlated_scalar_subquery": t.filter(
+        t.a > u.filter(u.a == t.a).aggregate(m=u.a.mean()).as_scalar()
+    ),
+    "table_as_scalar": t.filter(t.a > u.aggregate(m=u.a.max()).as_scalar()),
+    "window_range": t.select(
+        t.a.sum().over(group_by=t.b, order_by=t.a, range=(None, 0)).name("s")
+    ),
+    "window_rows": t.select(t.a.sum().over(order_by=t.a, rows=(-1, 0)).name("s")),
+    "window_rank": t.select(t.a.rank().name("r"), ibis.row_number().name("n")),
+    "window_ntile": t.select(ibis.ntile(2).over(order_by=t.a).name("n")),
+    "window_lag": t.select(t.a.lag(1, 0).over(order_by=t.a).name("p")),
+    "cross_join": t.cross_join(u),
+    "join_chain": t.join(u, t.a == u.a).select(t.b, u.c),
+    "reduction_where": t.aggregate(s=t.a.sum(where=t.b == "x")),
+    "reduction_how": t.aggregate(s=t.a.std(how="pop")),
+    "aggregate_by_only": t.aggregate(by=["a"]),
+    "shared_metric": t.aggregate([total.name("x"), total.name("y")]),
+    "dummy_table": ibis.literal(1).name("x").as_table(),
+    "coalesce": t.select(ibis.coalesce(t.b, "none").name("b")),
+    "truncate": ibis.timestamp("2024-01-01 00:00:00").truncate("M"),
+}
 
 
 def test_decompile_invalid_type():
@@ -76,6 +108,37 @@ def test_basic(expr, expected):
         assert restored.equals(expected)
     else:
         assert restored == expected
+
+
+@pytest.mark.parametrize("expr", roundtrip_cases.values(), ids=roundtrip_cases)
+def test_roundtrip(expr):
+    rendered = decompile(expr)
+
+    locals_ = {}
+    exec(rendered, {}, locals_)  # noqa: S102
+    restored = locals_["result"]
+
+    assert restored.equals(expr)
+    # the generated code is a fixed point
+    assert decompile(restored) == rendered
+
+
+def test_roundtrip_self_join():
+    # a view gets a fresh identity each time, so compare the generated SQL
+    expr = t.join(t.view(), "a")
+    rendered = decompile(expr)
+
+    locals_ = {}
+    exec(rendered, {}, locals_)  # noqa: S102
+    restored = locals_["result"]
+
+    assert ibis.to_sql(restored) == ibis.to_sql(expr)
+
+
+def test_variable_names_avoid_keywords_and_builtins():
+    rendered = decompile(roundtrip_cases["shared_metric"])
+    assert "sum_ = t.a.sum()" in rendered
+    assert "\nsum = " not in rendered
 
 
 def test_view():

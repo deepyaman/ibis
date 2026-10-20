@@ -8,7 +8,7 @@ import pytest
 from pytest import param
 
 import ibis
-from ibis.backends.duckdb.tests.test_parse_sql import assert_same_rows
+from ibis.backends.duckdb.tests.test_parse_sql import assert_same_rows, roundtrip
 from ibis.backends.tests.tpc.conftest import compare_tpc_results
 from ibis.formats.pandas import PandasData
 
@@ -140,12 +140,18 @@ def test_parse_sql_tpch(tpch_query, snapshot, con):
     compare_tpc_results(result_df, expected_df)
 
 
+@pytest.mark.parametrize("decompile", [False, True], ids=["parse", "roundtrip"])
 @pytest.mark.parametrize("tpch_query", range(1, 23), ids=lambda q: f"tpch{q:02d}")
-def test_parse_sql_tpch_results(tpch_query, con):
-    """Every TPC-H query parses into an expression that computes the same result."""
+def test_parse_sql_tpch_results(tpch_query, decompile, con):
+    """Every TPC-H query parses into an expression that computes the same result.
+
+    With `decompile`, the expression is decompiled to Python and rebuilt first.
+    """
     sql = (SQL_QUERY_PATH / f"{tpch_query:02d}.sql").read_text()
 
     expr = ibis.parse_sql(sql, tpch_catalog, dialect="duckdb")
+    if decompile:
+        expr = roundtrip(expr)
 
     with set_database(con, "tpch"):
         expected_df = con.con.execute(sql).df()
@@ -157,6 +163,7 @@ def test_parse_sql_tpch_results(tpch_query, con):
     compare_tpc_results(result_df, expected_df)
 
 
+@pytest.mark.parametrize("decompile", [False, True], ids=["parse", "roundtrip"])
 @pytest.mark.parametrize(
     "tpcds_query",
     [
@@ -170,13 +177,18 @@ def test_parse_sql_tpch_results(tpch_query, con):
         for q in range(1, 100)
     ],
 )
-def test_parse_sql_tpcds_results(tpcds_query, con):
-    """Every TPC-DS query parses into an expression that computes the same result."""
+def test_parse_sql_tpcds_results(tpcds_query, decompile, con):
+    """Every TPC-DS query parses into an expression that computes the same result.
+
+    With `decompile`, the expression is decompiled to Python and rebuilt first.
+    """
     sql = (TPCDS_QUERY_PATH / f"{tpcds_query:02d}.sql").read_text()
 
     with set_database(con, "tpcds"):
         catalog = {name: con.table(name).schema() for name in con.list_tables()}
         expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
+        if decompile:
+            expr = roundtrip(expr)
         expected_df = con.con.execute(sql).df()
         result_df = con.to_pandas(expr)
 

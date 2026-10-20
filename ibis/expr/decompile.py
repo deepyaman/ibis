@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import builtins
 import collections
+import enum
 import functools
 import io
 import itertools
+import keyword
 
 import ibis
 import ibis.expr.datatypes as dt
@@ -14,8 +17,11 @@ from ibis.expr.rewrites import simplify
 from ibis.util import experimental
 
 _method_overrides = {
+    ops.ApproxCountDistinct: "approx_nunique",
+    ops.ArrayCollect: "collect",
     ops.CountDistinct: "nunique",
     ops.CountStar: "count",
+    ops.DateTruncate: "truncate",
     ops.EndsWith: "endswith",
     ops.ExtractDay: "day",
     ops.ExtractDayOfYear: "day_of_year",
@@ -32,12 +38,20 @@ _method_overrides = {
     ops.Intersection: "intersect",
     ops.IsNull: "isnull",
     ops.Lowercase: "lower",
+    ops.MinRank: "rank",
+    ops.NthValue: "nth",
     ops.RegexSearch: "re_search",
+    ops.StandardDev: "std",
     ops.StartsWith: "startswith",
     ops.StringContains: "contains",
+    ops.StringLength: "length",
     ops.StringSQLILike: "ilike",
     ops.StringSQLLike: "like",
+    ops.Substring: "substr",
+    ops.TimeTruncate: "truncate",
+    ops.TimestampTruncate: "truncate",
     ops.Uppercase: "upper",
+    ops.Variance: "var",
 }
 
 
@@ -88,10 +102,33 @@ def now(_):
     return "ibis.now()"
 
 
+def _render_raw(value):
+    """Render a non-node argument (a Python value stored on the op) as code."""
+    if isinstance(value, enum.Enum):
+        value = value.value
+    return repr(value)
+
+
+def _nondefault_kwargs(op, kwargs):
+    """Keep the keyword arguments whose value differs from the op's default."""
+    params = op.__signature__.parameters
+    result = []
+    for name, rendered in kwargs.items():
+        raw = getattr(op, name)
+        if raw is None or raw == () or raw == params[name].default:
+            continue
+        if isinstance(raw, (tuple, list)):
+            rendered = f"[{_inline(rendered)}]"
+        elif not isinstance(raw, ops.Node):
+            rendered = _render_raw(raw)
+        result.append((name, rendered))
+    return result
+
+
 @translate.register(ops.Value)
 def value(op, *args, **kwargs):
     method = _get_method_name(op)
-    kwargs = [(k, v) for k, v in kwargs.items() if v is not None]
+    kwargs = _nondefault_kwargs(op, kwargs)
 
     if args:
         this, *args = args
@@ -108,6 +145,98 @@ def value(op, *args, **kwargs):
     parameters = ", ".join(filter(None, [args, kwargs]))
 
     return f"{this}.{method}({parameters})"
+
+
+@translate.register(ops.Coalesce)
+@translate.register(ops.Greatest)
+@translate.register(ops.Least)
+def variadic(op, arg):
+    return f"ibis.{_get_method_name(op)}({_inline(arg)})"
+
+
+@translate.register(ops.StringConcat)
+def string_concat(op, arg):
+    first, *rest = arg
+    return f"{first}.concat({_inline(rest)})"
+
+
+@translate.register(ops.Not)
+def not_(op, arg):
+    return f"~{_maybe_add_parens(op.arg, arg)}"
+
+
+@translate.register(ops.Negate)
+def negate(op, arg):
+    return f"-{_maybe_add_parens(op.arg, arg)}"
+
+
+@translate.register(ops.ExistsSubquery)
+def exists_subquery(op, rel, rendered):
+    # ``(pred).any()`` is the documented way to spell a correlated EXISTS;
+    # it needs the predicate to span exactly the inner and the outer table
+    if isinstance(op.rel, ops.Filter):
+        preds = op.rel.predicates
+        if len(set().union(*(pred.relations for pred in preds))) == 2:
+            pieces = [_maybe_add_parens(pred, rendered[pred]) for pred in preds]
+            return f"({' & '.join(pieces)}).any()"
+    return f"({rel}.count() > 0)"
+
+
+def _single_field(rel):
+    """Return (parent, name) if `rel` selects a single column of its parent."""
+    if isinstance(rel, ops.Project) and len(rel.values) == 1:
+        (field,) = rel.values.values()
+        if isinstance(field, ops.Field) and field.rel == rel.parent:
+            return rel.parent, field.name
+    return None
+
+
+@translate.register(ops.ScalarSubquery)
+def scalar_subquery(op, rel, rendered):
+    if (single := _single_field(op.rel)) is not None:
+        parent, name = single
+        return f"{rendered[parent]}.{name}.as_scalar()"
+    return f"{rel}.as_scalar()"
+
+
+@translate.register(ops.InSubquery)
+def in_subquery(op, rel, needle, rendered):
+    if (single := _single_field(op.rel)) is not None:
+        parent, name = single
+        return f"{needle}.isin({rendered[parent]}.{name})"
+    (name,) = op.rel.schema.names
+    return f"{needle}.isin({rel}.{name})"
+
+
+@translate.register(ops.RankBase)
+def rank(op):
+    return f"ibis.{_get_method_name(op)}()"
+
+
+@translate.register(ops.NTile)
+def ntile(op, buckets):
+    return f"ibis.ntile({buckets})"
+
+
+@translate.register(ops.WindowBoundary)
+def window_boundary(op, value, preceding):
+    if isinstance(value, CallStatement):
+        value = value.args
+    if preceding and getattr(op.value, "value", None) != 0:
+        return f"-{value}"
+    return value
+
+
+@translate.register(ops.WindowFunction)
+def window_function(op, func, how, start, end, group_by, order_by):
+    params = []
+    if group_by:
+        params.append(f"group_by=[{_inline(group_by)}]")
+    if order_by:
+        params.append(f"order_by=[{_inline(order_by)}]")
+    if start is not None or end is not None:
+        params.append(f"{how}=({start}, {end})")
+    return f"{func}.over({', '.join(params)})"
 
 
 @translate.register(ops.ScalarParameter)
@@ -182,6 +311,8 @@ def aggregation(op, parent, groups, metrics):
         return f"{parent}.aggregate([{_inline(metrics)}], by=[{_inline(groups)}])"
     elif metrics:
         return f"{parent}.aggregate([{_inline(metrics)}])"
+    elif groups:
+        return f"{parent}.aggregate(by=[{_inline(groups)}])"
     else:
         raise ValueError("No metrics to aggregate")
 
@@ -208,6 +339,8 @@ def join_reference(op, parent, identifier):
 
 @translate.register(ops.JoinLink)
 def join_link(op, table, predicates, how):
+    if not predicates:
+        return f".{how}_join({table})"
     return f".{how}_join({table}, {_try_unwrap(predicates)})"
 
 
@@ -258,7 +391,9 @@ def sort_key(op, arg, ascending, nulls_first):
 @translate.register(ops.Reduction)
 def reduction(op, arg, where, **kwargs):
     method = _get_method_name(op)
-    return f"{arg}.{method}()"
+    kwargs = _nondefault_kwargs(op, {**kwargs, "where": where})
+    params = ", ".join(f"{k}={v}" for k, v in kwargs)
+    return f"{arg}.{method}({params})"
 
 
 @translate.register(ops.Alias)
@@ -282,9 +417,11 @@ def literal(op, value, dtype):
     elif isinstance(op.dtype, dt.Date):
         return f"ibis.date({value!r})"
     elif isinstance(op.dtype, dt.Interval):
-        return f"ibis.interval({value!r})"
+        return f"ibis.interval({value!r}, {op.dtype.unit.value!r})"
+    elif isinstance(op.dtype, dt.Decimal):
+        return CallStatement("ibis.literal", f"{str(value)!r}, {str(dtype)!r}")
     elif inferred.type() != op.dtype:
-        return CallStatement("ibis.literal", f"{value!r}, {dtype}")
+        return CallStatement("ibis.literal", f"{value!r}, {str(dtype)!r}")
     else:
         # prefer plain python literal values if the inferred datatype is the same,
         # though this makes rendering method calls on literals more complicated
@@ -323,8 +460,9 @@ _infix_ops = {
     ops.Greater: ">",
     ops.LessEqual: "<=",
     ops.Less: "<",
-    ops.And: "and",
-    ops.Or: "or",
+    ops.And: "&",
+    ops.Or: "|",
+    ops.Xor: "^",
     ops.Add: "+",
     ops.Subtract: "-",
     ops.Multiply: "*",
@@ -347,7 +485,17 @@ def binary(op, left, right):
 
 @translate.register(ops.InValues)
 def isin(op, value, options):
-    return f"{value}.isin(({', '.join([str(option) for option in options])}))"
+    return f"{value}.isin([{_inline(options)}])"
+
+
+@translate.register(ops.DummyTable)
+def dummy_table(op, values):
+    values = _wrap_alias(op.values, values)
+    first, *rest = values
+    out = f"{first}.as_table()"
+    if rest:
+        out = f"{out}.mutate({_inline(rest)})"
+    return out
 
 
 class CodeContext:
@@ -359,6 +507,7 @@ class CodeContext:
     )
 
     always_ignore = (
+        ops.JoinLink,
         ops.JoinReference,
         ops.Field,
         dt.Primitive,
@@ -375,9 +524,13 @@ class CodeContext:
         ops.Sort: "s",
     }
 
+    # rules that look at how another node was rendered
+    needs_rendered = (ops.ExistsSubquery, ops.ScalarSubquery, ops.InSubquery)
+
     def __init__(self, assign_result_to="result"):
         self.assign_result_to = assign_result_to
         self._shorthand_counters = collections.defaultdict(itertools.count)
+        self.rendered = {}
 
     def variable_for(self, node):
         klass = type(node)
@@ -387,6 +540,9 @@ class CodeContext:
             name = self.shorthands[klass]
         else:
             name = klass.__name__.lower()
+
+        if keyword.iskeyword(name) or hasattr(builtins, name):
+            name = f"{name}_"
 
         # increment repeated type names: table, table1, table2, ...
         nth = next(self._shorthand_counters[name]) or ""
@@ -449,15 +605,26 @@ def decompile(
     node = simplify(node)
     out = io.StringIO()
     ctx = CodeContext(assign_result_to=assign_result_to)
-    dependents = Graph(node).invert()
+    graph = Graph(node)
+    dependents = graph.invert()
+
+    # a relation joined through a `JoinReference` is referenced by the join's
+    # predicates and projections, so it must be bound to a name
+    joined = collections.Counter()
+    for n in graph:
+        if isinstance(n, ops.JoinReference):
+            joined[n.parent] += len(dependents[n])
 
     def fn(node, _, *args, **kwargs):
+        if isinstance(node, ctx.needs_rendered):
+            kwargs["rendered"] = ctx.rendered
         code = translate(node, *args, **kwargs)
-        n_dependents = len(dependents[node])
+        n_dependents = len(dependents[node]) + joined[node]
 
         code, result = ctx.render(node, code, n_dependents)
         if code:
             out.write(code)
+        ctx.rendered[node] = result
 
         return result
 

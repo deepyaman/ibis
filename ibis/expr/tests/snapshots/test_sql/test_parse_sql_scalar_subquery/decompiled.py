@@ -13,4 +13,4 @@ call = ibis.table(
 selfreference = call.view()
 agg = selfreference.aggregate([selfreference.call_attempts.mean().name("mean")])
 
-result = call.filter((call.call_attempts > agg.scalar_subquery()))
+result = call.filter((call.call_attempts > agg.as_scalar()))

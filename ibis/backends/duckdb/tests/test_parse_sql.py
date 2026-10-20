@@ -153,9 +153,28 @@ CASES = {
 }
 
 
+def roundtrip(expr):
+    """Decompile `expr` to Python, run that code, and return what it builds."""
+    code = ibis.decompile(expr)
+    namespace = {}
+    exec(code, {}, namespace)  # noqa: S102
+    return namespace["result"]
+
+
 @pytest.mark.parametrize("sql", list(CASES.values()), ids=list(CASES))
 def test_parse_sql_matches_duckdb(duck, sql):
     expr = ibis.parse_sql(sql, CATALOG, dialect="duckdb")
+
+    expected = duck.execute(sql).df()
+    result = ibis.duckdb.from_connection(duck).to_pandas(expr)
+
+    assert_same_rows(result, expected)
+
+
+@pytest.mark.parametrize("sql", list(CASES.values()), ids=list(CASES))
+def test_decompile_roundtrip_matches_duckdb(duck, sql):
+    """Parsed SQL decompiles to Python that rebuilds an equivalent expression."""
+    expr = roundtrip(ibis.parse_sql(sql, CATALOG, dialect="duckdb"))
 
     expected = duck.execute(sql).df()
     result = ibis.duckdb.from_connection(duck).to_pandas(expr)
