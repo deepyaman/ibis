@@ -135,6 +135,24 @@ CASES = {
     "distinct_order_by": "SELECT DISTINCT a FROM t ORDER BY a",
     "cte_corr_scalar": "WITH x AS (SELECT a, c FROM t WHERE a > 1) SELECT a FROM x WHERE c > (SELECT AVG(u.a) FROM u WHERE u.a = x.a)",
     "exists_join_inner": "SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM u JOIN t AS t2 ON u.a = t2.a WHERE t2.c = t.c)",
+    "rank_over_sum_group": "SELECT a, RANK() OVER (ORDER BY SUM(c) DESC) AS r FROM t GROUP BY a",
+    "extract_day_of_week": "SELECT EXTRACT(dow FROM d) AS dow, EXTRACT(isodow FROM d) AS iso, EXTRACT(dow FROM DATE '2024-01-07') AS sun, EXTRACT(isodow FROM DATE '2024-01-07') AS isosun, EXTRACT(doy FROM d) AS doy FROM t",
+    "extract_more_units": "SELECT EXTRACT(epoch FROM ts) AS e, EXTRACT(week FROM d) AS w, EXTRACT(quarter FROM d) AS q, EXTRACT(millisecond FROM ts) AS ms FROM t",
+    "date_part": "SELECT DATE_PART('year', d) AS y, DATE_PART('dow', d) AS dow, DATE_PART('days', d) AS dd FROM t",
+    "is_distinct_from": "SELECT a FROM t WHERE b IS DISTINCT FROM 'foo'",
+    "is_not_distinct_from_null": "SELECT a FROM t WHERE b IS NOT DISTINCT FROM NULL",
+    "join_is_not_distinct_from": "SELECT t.a, u.x FROM t JOIN u ON t.a IS NOT DISTINCT FROM u.a",
+    "string_agg": "SELECT STRING_AGG(b, ',' ORDER BY a, b) AS s FROM t",
+    "string_agg_group": "SELECT a, STRING_AGG(b, '|' ORDER BY b) AS s, STRING_AGG(b ORDER BY b) AS t FROM t GROUP BY a",
+    "bool_or_and": "SELECT BOOL_OR(a > 1) AS any_big, BOOL_AND(a > 1) AS all_big FROM t",
+    "int_div": "SELECT a // 2 AS h, a % 2 AS m FROM t",
+    "date_diff": "SELECT DATE_DIFF('day', d, DATE '2024-06-01') AS days, DATE_DIFF('month', d, DATE '2024-06-01') AS months, DATE_DIFF('hour', ts, TIMESTAMP '2024-06-01 00:00:00') AS hours FROM t",
+    "current_date": "SELECT a FROM t WHERE d < CURRENT_DATE AND ts < CURRENT_TIMESTAMP AND ts < NOW() AND d < TODAY()",
+    "exp_log": "SELECT EXP(c) AS e, LOG(c) AS l10, LOG(2, c) AS l2, LN(c) AS l FROM t",
+    "position": "SELECT POSITION('a' IN b) AS p, STRPOS(b, 'z') AS z FROM t",
+    "split_part": "SELECT SPLIT_PART(b, 'a', 1) AS p1, SPLIT_PART(b, 'a', 2) AS p2 FROM t",
+    "regexp_matches": "SELECT a FROM t WHERE REGEXP_MATCHES(b, '^ba')",
+    "select_without_from_order_by": "SELECT 2 AS two, 1 AS one ORDER BY one",
 }
 
 UNSUPPORTED = {
@@ -167,7 +185,13 @@ UNSUPPORTED = {
         "outer join",
     ),
     "unknown_function": ("SELECT MD5(b) FROM t", "MD5"),
+    "unknown_anonymous_function": ("SELECT FOO(b) FROM t", "FOO"),
     "any_lt": ("SELECT a FROM t WHERE a < ANY (SELECT a FROM u)", "ANY"),
+    "substring_from_zero": ("SELECT SUBSTRING(b, 0, 2) FROM t", "SUBSTRING"),
+    "substring_from_negative": ("SELECT SUBSTRING(b, -1, 2) FROM t", "SUBSTRING"),
+    "split_part_zero": ("SELECT SPLIT_PART(b, 'a', 0) FROM t", "SPLIT_PART"),
+    "extract_decade": ("SELECT EXTRACT(decade FROM d) FROM t", "(?i)decade"),
+    "regexp_flags": ("SELECT REGEXP_MATCHES(b, 'A', 'i') FROM t", "(?i)flags"),
 }
 
 

@@ -268,3 +268,15 @@ def test_join_projection_with_a_window_is_not_the_chain_output():
 def test_column_outside_group_by_is_rejected():
     with pytest.raises(com.IbisInputError, match="GROUP BY"):
         ibis.parse_sql("SELECT a, b FROM t GROUP BY a", tables)
+
+
+def test_concat_null_handling_follows_the_dialect():
+    sql = "SELECT CONCAT(b, 'x') AS bx FROM t"
+    # CONCAT skips NULL arguments in DuckDB and propagates them in MySQL
+    assert "COALESCE" in ibis.to_sql(ibis.parse_sql(sql, tables, dialect="duckdb"))
+    assert "COALESCE" not in ibis.to_sql(ibis.parse_sql(sql, tables, dialect="mysql"))
+
+
+def test_from_less_select_keeps_its_order_by():
+    expr = ibis.parse_sql("SELECT 2 AS two, 1 AS one ORDER BY one", tables)
+    assert isinstance(expr.op(), ops.Sort)

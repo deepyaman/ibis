@@ -678,6 +678,9 @@ def _convert_from_less(select, scope):
     scope.rebind(rel)
     if where := _conjuncts(select.args.get("where")):
         rel = rel.filter([convert(condition, scope) for condition in where])
+    if (order := select.args.get("order")) is not None:
+        columns = [rel[name] for name in rel.columns]
+        rel = _order_by(order, scope, rel, columns, distinct=False)
     return _limit(select, rel, scope)
 
 
@@ -842,14 +845,19 @@ _binary_operations = {
     sge.Sub: operator.sub,
     sge.Mul: operator.mul,
     sge.Div: operator.truediv,
+    sge.IntDiv: operator.floordiv,
     sge.Mod: operator.mod,
     sge.Pow: operator.pow,
     sge.And: operator.and_,
     sge.Or: operator.or_,
+    # IS [NOT] DISTINCT FROM
+    sge.NullSafeEQ: lambda left, right: left.identical_to(right),
+    sge.NullSafeNEQ: lambda left, right: ~left.identical_to(right),
 }
 
 
 _COMPARISONS = (sge.LT, sge.LTE, sge.GT, sge.GTE, sge.EQ, sge.NEQ)
+_NULL_SAFE = (sge.NullSafeEQ, sge.NullSafeNEQ)
 
 
 def _convert_quantified(binary, scope):
@@ -868,7 +876,9 @@ def convert_binary(binary, scope):
     left, right = binary.this, binary.expression
     if isinstance(right, (sge.Any, sge.All)):
         return _convert_quantified(binary, scope)
-    if isinstance(left, sge.Null) or isinstance(right, sge.Null):
+    if (isinstance(left, sge.Null) or isinstance(right, sge.Null)) and not isinstance(
+        binary, _NULL_SAFE
+    ):
         # SQL's NULL compares to and computes with everything as NULL; Ibis
         # would read ``x = NULL`` as ``x IS NULL``
         if isinstance(binary, _COMPARISONS):
@@ -919,6 +929,8 @@ _reduction_methods = {
     sge.Sum: "sum",
     sge.Avg: "mean",
     sge.ArrayAgg: "collect",
+    sge.LogicalOr: "any",
+    sge.LogicalAnd: "all",
 }
 
 
@@ -954,6 +966,23 @@ def convert_variance_pop(reduction, scope):
 @_convert.register(sge.ApproxDistinct)
 def convert_approx_distinct(reduction, scope):
     return convert(reduction.this, scope=scope).approx_nunique()
+
+
+@_convert.register(sge.GroupConcat)
+def convert_group_concat(func, scope):
+    this = func.this
+    order_by = None
+    if isinstance(this, sge.Order):
+        # ``STRING_AGG(x, ',' ORDER BY y)``
+        order_by = [convert(key, scope=scope) for key in this.expressions]
+        this = this.this
+    if (separator := func.args.get("separator")) is None:
+        sep = ","
+    elif isinstance(separator, sge.Literal) and separator.is_string:
+        sep = separator.name
+    else:
+        raise _unsupported(func, scope, "STRING_AGG with a computed separator")
+    return convert(this, scope=scope).group_concat(sep, order_by=order_by)
 
 
 _ranking_functions = {
@@ -1115,6 +1144,20 @@ def convert_ln(func, scope):
     return convert(func.this, scope=scope).ln()
 
 
+@_convert.register(sge.Exp)
+def convert_exp(func, scope):
+    return convert(func.this, scope=scope).exp()
+
+
+@_convert.register(sge.Log)
+def convert_log(func, scope):
+    if (expression := func.expression) is None:
+        # sqlglot parses ``LOG(x)`` as ``LN(x)`` for the dialects where it is
+        # the natural logarithm, so a bare ``LOG`` is base 10
+        return convert(func.this, scope=scope).log10()
+    return convert(expression, scope=scope).log(convert(func.this, scope=scope))
+
+
 @_convert.register(sge.Greatest)
 def convert_greatest(func, scope):
     return ibis.greatest(
@@ -1134,8 +1177,9 @@ def convert_least(func, scope):
 @_convert.register(sge.Concat)
 def convert_concat(func, scope):
     args = [convert(e, scope=scope) for e in func.expressions]
-    if func.args.get("safe"):
-        # CONCAT() skips NULL arguments where ``||`` propagates them
+    if func.args.get("coalesce"):
+        # in this dialect CONCAT() skips NULL arguments where ``||``
+        # propagates them
         args = [ibis.coalesce(arg, "") for arg in args]
     first, *rest = args
     for arg in rest:
@@ -1220,9 +1264,50 @@ def convert_case(case, scope):
     return ibis.cases(*branches, else_=else_)
 
 
+@_convert.register(sge.StrPosition)
+def convert_str_position(func, scope):
+    if func.args.get("position") is not None or func.args.get("occurrence"):
+        raise _unsupported(func, scope, "POSITION with a start or occurrence")
+    this = convert(func.this, scope=scope)
+    # SQL positions are 1-based with 0 for "not found"; ``find`` is 0-based
+    return this.find(convert(func.args["substr"], scope=scope)) + 1
+
+
+@_convert.register(sge.SplitPart)
+def convert_split_part(func, scope):
+    index = func.args["part_index"]
+    if (n := _literal_int(index)) is not None and n < 1:
+        raise _unsupported(func, scope, "SPLIT_PART with a part before the first")
+    this = convert(func.this, scope=scope)
+    parts = this.split(convert(func.args["delimiter"], scope=scope))
+    # SQL's parts are 1-based, and a part past the last one is the empty string
+    part = parts[n - 1 if n is not None else convert(index, scope=scope) - 1]
+    return this.isnull().ifelse(ibis.null(dt.string), part.fill_null(""))
+
+
+@_convert.register(sge.RegexpLike)
+def convert_regexp_like(func, scope):
+    if func.args.get("flag") is not None:
+        raise _unsupported(func, scope, "A regular expression with flags")
+    this = convert(func.this, scope=scope)
+    return this.re_search(convert(func.expression, scope=scope))
+
+
+def _literal_int(node) -> int | None:
+    """The value of an integer literal, possibly negated; else ``None``."""
+    if isinstance(node, sge.Neg) and (value := _literal_int(node.this)) is not None:
+        return -value
+    if isinstance(node, sge.Literal) and node.is_int:
+        return int(node.this)
+    return None
+
+
 @_convert.register(sge.Substring)
 def convert_substring(substring, scope):
     this = convert(substring.this, scope=scope)
+    if (start := _literal_int(substring.args["start"])) is not None and start < 1:
+        # engines disagree on what a start before the first character means
+        raise _unsupported(substring, scope, "SUBSTRING with a start before 1")
     # SQL substrings are 1-based
     start = convert(substring.args["start"], scope=scope) - 1
     if (length := substring.args.get("length")) is not None:
@@ -1230,13 +1315,73 @@ def convert_substring(substring, scope):
     return this.substr(start)
 
 
+_extract_methods = {
+    "year": "year",
+    "quarter": "quarter",
+    "month": "month",
+    "week": "week_of_year",
+    "day": "day",
+    "doy": "day_of_year",
+    "dayofyear": "day_of_year",
+    "hour": "hour",
+    "minute": "minute",
+    "second": "second",
+    "millisecond": "millisecond",
+    "microsecond": "microsecond",
+    "epoch": "epoch_seconds",
+}
+
+
+def _extract(unit, this, node, scope):
+    unit = unit.lower().removesuffix("s")
+    if unit in ("dow", "dayofweek"):
+        # SQL counts the days of the week from Sunday as 0, Ibis from Monday
+        return (this.day_of_week.index() + 1) % 7
+    if unit == "isodow":
+        return this.day_of_week.index() + 1
+    if (method := _extract_methods.get(unit)) is None:
+        raise _unsupported(node, scope, f"Extracting {unit!r}")
+    return getattr(this, method)()
+
+
 @_convert.register(sge.Extract)
 def convert_extract(extract, scope):
-    unit = extract.this.name.lower()
-    this = convert(extract.expression, scope=scope)
-    if (method := getattr(this, unit, None)) is None:
-        raise _unsupported(extract, scope)
-    return method()
+    return _extract(
+        extract.this.name, convert(extract.expression, scope=scope), extract, scope
+    )
+
+
+@_convert.register(sge.DateDiff)
+def convert_date_diff(func, scope):
+    unit = func.args.get("unit")
+    unit = "day" if unit is None else unit.name.lower().removesuffix("s")
+    this = convert(func.this, scope=scope)
+    return this.delta(convert(func.expression, scope=scope), unit=unit)
+
+
+@_convert.register(sge.CurrentDate)
+def convert_current_date(func, scope):
+    return ibis.today()
+
+
+@_convert.register(sge.CurrentTimestamp)
+def convert_current_timestamp(func, scope):
+    return ibis.now()
+
+
+@_convert.register(sge.Anonymous)
+def convert_anonymous(func, scope):
+    # functions sqlglot leaves as calls by name
+    name = func.name.upper()
+    if name in ("DATE_PART", "DATEPART") and len(func.expressions) == 2:
+        unit, this = func.expressions
+        if isinstance(unit, sge.Literal) and unit.is_string:
+            return _extract(unit.name, convert(this, scope=scope), func, scope)
+    if name == "NOW" and not func.expressions:
+        return ibis.now()
+    if name == "TODAY" and not func.expressions:
+        return ibis.today()
+    raise _unsupported(func, scope, f"The function {func.name}")
 
 
 _interval_units = {

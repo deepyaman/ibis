@@ -44,7 +44,9 @@ _method_overrides = {
     ops.StandardDev: "std",
     ops.StartsWith: "startswith",
     ops.StringContains: "contains",
+    ops.StringFind: "find",
     ops.StringLength: "length",
+    ops.StringSplit: "split",
     ops.StringSQLILike: "ilike",
     ops.StringSQLLike: "like",
     ops.Substring: "substr",
@@ -100,6 +102,11 @@ def translate(op, *args, **kwargs):
 @translate.register(ops.TimestampNow)
 def now(_):
     return "ibis.now()"
+
+
+@translate.register(ops.DateNow)
+def today(_):
+    return "ibis.today()"
 
 
 def _render_raw(value):
@@ -163,6 +170,29 @@ def string_concat(op, arg):
 @translate.register(ops.Not)
 def not_(op, arg):
     return f"~{_maybe_add_parens(op.arg, arg)}"
+
+
+@translate.register(ops.IdenticalTo)
+def identical_to(op, left, right):
+    return f"{left}.identical_to({right})"
+
+
+@translate.register(ops.ArrayIndex)
+def array_index(op, arg, index):
+    return f"{arg}[{index}]"
+
+
+@translate.register(ops.DayOfWeekIndex)
+def day_of_week_index(op, arg):
+    return f"{arg}.day_of_week.index()"
+
+
+@translate.register(ops.DateDelta)
+@translate.register(ops.TimeDelta)
+@translate.register(ops.TimestampDelta)
+def temporal_delta(op, left, right, part):
+    unit = repr(op.part.value) if isinstance(op.part, ops.Literal) else part
+    return f"{left}.delta({right}, unit={unit})"
 
 
 @translate.register(ops.Negate)
@@ -472,6 +502,7 @@ _infix_ops = {
     ops.Subtract: "-",
     ops.Multiply: "*",
     ops.Divide: "/",
+    ops.FloorDivide: "//",
     ops.Power: "**",
     ops.Modulus: "%",
     ops.TimestampAdd: "+",
