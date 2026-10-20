@@ -334,3 +334,33 @@ The one wrong result is the decimal typing above (`AVG(CAST(c AS DECIMAL(10, 2))
 `> ALL (subquery)`. The three roundtrip-only raises are decompiler gaps the review already assigned
 to the decompile PR: `PERCENT_RANK()`/`CUME_DIST()` render with no arguments, a nested EXISTS trips
 the `.any()` unpack, `NULLIF` renders as `.null_if`.
+
+## Planner vs AST converter, measured (2026-10-20)
+
+Numbers for the planner column come from `PARSE_SQL_REVIEW.md` (the branch at `2036a63a8`); the AST
+column is the branch at `051539ec3`. The battery scripts now travel with the branch as
+`PARSE_SQL_BATTERY.py` and `PARSE_SQL_BATTERY_RT.py` (run from the worktree with
+`PYTHONPATH=$PWD`); drop them with the notes before any PR.
+
+| | Planner converter (branch at review time) | AST converter (branch now) |
+|---|---|---|
+| Review battery, 184 queries (ok / silently wrong / raise) | 143 / 5 / 36 | 176 / 1 / 7 |
+| Same after a decompile round trip | 138 / 5 / 41 | 173 / 1 / 10 |
+| `main` before the branch, for scale | 50 / 10 / 124 | |
+| Gate | 392 passed, 20 xfailed | 611 passed, 18 xfailed |
+| What the gate checks | sorted rows, names ignored, numbers rounded to 2 decimals | row order under ORDER BY, names, value kinds, exact values (floats 1e-9) |
+| TPC-H / TPC-DS | 22/22, 90/99 | 22/22, 90/99 (the same 9 ROLLUP queries: an Ibis gap) |
+| Everyday SQL cases | 54, OFFSET xfailed | 120, OFFSET passes |
+| Unsupported / invalid SQL tests | 0 / 0 | 36 / 22 |
+| Silent wrong results known | DISTINCT ON, QUALIFY, OFFSET dropped, `_h` alias dropped, `= NULL` as IS NULL, TRY_CAST as CAST, SUBSTRING from 0 or -1, decimal rounding hidden by the comparator | decimal typing only, flagged on 17 queries with a strict mark |
+| Derived tables with computed columns | regressed against main | work |
+| Failure mode for SQL it cannot handle | `KeyError: 's'`, `KeyError: ''`, `TypeError: <class 'sqlglot.expressions.MD5'>`, "Column 'channel' is not found" for ROLLUP | `UnsupportedOperationError` naming the construct, `IbisInputError` naming the SQL fragment |
+| Optimizer rules | `pushdown_predicates` and `pushdown_projections` needed, `merge_subqueries` dropped | `qualify`, `annotate_types`, `canonicalize`; heavier sets measured equal |
+| `ibis/expr/sql.py` | 1449 lines, about 400 undoing planner artifacts | 1703 lines, none undoing anything; the growth is functions and validation |
+| sqlglot coupling | `import ibis` broke below 26, CTEs silently unbound below 28, OFFSET needed a planner from 30.18 | renames absorbed, OFFSET independent of the planner; classes registered at import still need the floor decision (B4) |
+| Decompiled TPC-H q02 (Phase A review) | three `.view()`s, per-scan `.select(...)`, planner join shape | `join(..., keys)` for comma joins, `.any()` for EXISTS, no per-scan selects |
+
+Open in both: ROLLUP and GROUPING SETS (expression model), the decimal typing (B5), the three
+decompiler gaps above (decompile PR). Known AST edge: a window function whose argument is
+structurally equal to a metric of the same aggregate query hits the memo and raises instead of
+translating.
