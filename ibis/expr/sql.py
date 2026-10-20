@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import decimal
 import operator
 import re
 from dataclasses import dataclass, field
@@ -864,13 +865,31 @@ def convert_filtered_aggregate(node, scope):
     return op.copy(where=where.op()).to_expr()
 
 
+def _number(text):
+    """A non-integer numeric literal.
+
+    Written with a decimal point it is a decimal typed by its digits, as SQL
+    engines type it (``1.10`` is ``decimal(3, 2)``); written with an exponent
+    it is a float.
+    """
+    if "e" in text.lower():
+        return ibis.literal(float(text))
+    whole, _, fraction = text.lstrip("-").partition(".")
+    precision = len(whole or "0") + len(fraction)
+    if precision > 38:
+        return ibis.literal(float(text))
+    return ibis.literal(
+        decimal.Decimal(text), type=dt.Decimal(precision, len(fraction))
+    )
+
+
 @_convert.register(sge.Literal)
 def convert_literal(literal, scope):
     value = literal.this
     if literal.is_int:
-        value = int(value)
-    elif literal.is_number:
-        value = float(value)
+        return ibis.literal(int(value))
+    if literal.is_number:
+        return _number(value)
     return ibis.literal(value)
 
 
@@ -948,6 +967,37 @@ _binary_operations = {
 
 _COMPARISONS = (sge.LT, sge.LTE, sge.GT, sge.GTE, sge.EQ, sge.NEQ)
 _NULL_SAFE = (sge.NullSafeEQ, sge.NullSafeNEQ)
+_ARITHMETIC = (sge.Add, sge.Sub, sge.Mul, sge.Div, sge.IntDiv, sge.Mod, sge.Pow)
+
+
+def _align_numeric(left, right):
+    """Give the operands of an arithmetic operator a type Ibis can rank.
+
+    A float and a decimal compute in floating point in SQL engines, where
+    Ibis would type the result decimal and narrow it to that scale on fetch.
+    Two decimals rank by precision and scale together, so one narrower in
+    precision but wider in scale (``decimal(38, 2) * 0.0001``) has no common
+    type until the narrower one is widened to both.
+    """
+    ltype, rtype = left.type(), right.type()
+    if ltype.is_floating() and rtype.is_decimal():
+        return left, right.cast(ltype)
+    if rtype.is_floating() and ltype.is_decimal():
+        return left.cast(rtype), right
+    if (
+        ltype.is_decimal()
+        and rtype.is_decimal()
+        and None not in (ltype.precision, ltype.scale, rtype.precision, rtype.scale)
+        and not (ltype.castable(rtype) or rtype.castable(ltype))
+    ):
+        wide = dt.Decimal(
+            min(max(ltype.precision, rtype.precision), 38),
+            max(ltype.scale, rtype.scale),
+        )
+        if ltype.precision < rtype.precision:
+            return left.cast(wide), right
+        return left, right.cast(wide)
+    return left, right
 
 
 def _convert_quantified(binary, scope):
@@ -981,7 +1031,10 @@ def convert_binary(binary, scope):
             )
         other = convert(right if isinstance(left, sge.Null) else left, scope)
         return ibis.null(other.type())
-    return op(convert(left, scope), convert(right, scope))
+    left, right = convert(left, scope), convert(right, scope)
+    if isinstance(binary, _ARITHMETIC):
+        left, right = _align_numeric(left, right)
+    return op(left, right)
 
 
 @_convert.register(sge.Is)
@@ -1614,6 +1667,14 @@ def parse_sql(sqlstring, catalog, dialect=None):
     Returns
     -------
     expr : ir.Expr
+
+    Notes
+    -----
+    A numeric literal written with a decimal point is typed ``decimal`` by its
+    digits, as engines type it; written with an exponent it is ``float64``.
+    A ``SUBSTRING`` whose start is a literal before 1 is rejected, because
+    engines disagree on what it means; a computed start before 1 follows
+    Ibis, which counts a negative start from the end of the string.
 
     """
     catalog = Catalog(
