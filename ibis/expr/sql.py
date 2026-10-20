@@ -49,6 +49,23 @@ def _arg(node, *names):
     return None
 
 
+def _qualify_applies_star_replace() -> bool:
+    """Whether ``qualify`` applies ``SELECT * REPLACE (...)``.
+
+    Older sqlglot releases expand the star and drop the replacements, which
+    would give a wrong result rather than an error.
+    """
+    select = sg.parse_one("SELECT * REPLACE (a + 1 AS a) FROM t")
+    qualified = qualify(select, schema={"t": {"a": "INT"}})
+    return any(
+        isinstance(e, sge.Alias) and not isinstance(e.this, sge.Column)
+        for e in qualified.expressions
+    )
+
+
+_STAR_REPLACE = _qualify_applies_star_replace()
+
+
 class Catalog(dict[str, ir.Table]):
     """A catalog of tables and their schemas."""
 
@@ -1142,29 +1159,39 @@ def convert_group_concat(func, scope):
     return convert(this, scope=scope).group_concat(sep, order_by=order_by)
 
 
+# the Ibis function for each ranking function, by the name of its sqlglot
+# class; ``Rank``, ``DenseRank``, ``PercentRank``, ``CumeDist`` and ``Ntile``
+# exist from sqlglot 27.11, so they are registered where ``sge`` has them
 _ranking_functions = {
-    sge.RowNumber: "row_number",
-    sge.Rank: "rank",
-    sge.DenseRank: "dense_rank",
-    sge.PercentRank: "percent_rank",
-    sge.CumeDist: "cume_dist",
+    "RowNumber": "row_number",
+    "Rank": "rank",
+    "DenseRank": "dense_rank",
+    "PercentRank": "percent_rank",
+    "CumeDist": "cume_dist",
 }
 
 
-@_convert.register(sge.RowNumber)
-@_convert.register(sge.Rank)
-@_convert.register(sge.DenseRank)
-@_convert.register(sge.PercentRank)
-@_convert.register(sge.CumeDist)
+def _register(name):
+    """Register a rule for the sqlglot class ``name`` if this sqlglot has it."""
+    cls = getattr(sge, name, None)
+    return _convert.register(cls) if cls is not None else (lambda f: f)
+
+
+@_register("RowNumber")
+@_register("Rank")
+@_register("DenseRank")
+@_register("PercentRank")
+@_register("CumeDist")
 def convert_ranking(func, scope):
-    result = getattr(ibis, _ranking_functions[type(func)])()
-    if isinstance(func, (sge.RowNumber, sge.Rank, sge.DenseRank)):
+    name = type(func).__name__
+    result = getattr(ibis, _ranking_functions[name])()
+    if name in ("RowNumber", "Rank", "DenseRank"):
         # SQL's ranking functions are 1-based, Ibis's are 0-based
         return result + 1
     return result
 
 
-@_convert.register(sge.Ntile)
+@_register("Ntile")
 def convert_ntile(ntile, scope):
     # SQL's NTILE is 1-based, Ibis's is 0-based
     return ibis.ntile(convert(ntile.this, scope=scope)) + 1
@@ -1479,7 +1506,7 @@ def convert_str_position(func, scope):
     return this.find(convert(func.args["substr"], scope=scope)) + 1
 
 
-@_convert.register(sge.SplitPart)
+@_register("SplitPart")  # parsed as ``Anonymous`` before sqlglot 25
 def convert_split_part(func, scope):
     index = func.args["part_index"]
     if (n := _literal_int(index)) is not None and n < 1:
@@ -1714,6 +1741,10 @@ def parse_sql(sqlstring, catalog, dialect=None):
         if join.method:
             # qualify cannot resolve the columns of these joins; say why first
             raise _unsupported(join, scope, f"A {join.method} join")
+    if not _STAR_REPLACE:
+        for star in expr.find_all(sge.Star):
+            if star.args.get("replace"):
+                raise _unsupported(star, scope, "* REPLACE on this sqlglot release")
     try:
         tree = sgo.optimize(
             expr,
