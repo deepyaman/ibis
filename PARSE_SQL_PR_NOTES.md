@@ -364,3 +364,83 @@ Open in both: ROLLUP and GROUPING SETS (expression model), the decimal typing (B
 decompiler gaps above (decompile PR). Known AST edge: a window function whose argument is
 structurally equal to a metric of the same aggregate query hits the memo and raises instead of
 translating.
+
+## Phase B, session 2: the review 2 fix session (2026-10-20)
+
+**Commits** (on top of the review note, rebased onto `main` at `67dbda44c`, whose `uv.lock` is now
+sqlglot 30.13.0): `fix(parse_sql): read the negate arg of NOT [I]LIKE` (B2), `fix(parse_sql): give
+IS TRUE and IS FALSE no NULLs`, `fix(parse_sql): frame three window shapes like SQL`,
+`fix(parse_sql): translate CONCAT_WS and skip NULLs`, `fix(decompile): keep literal left operands as
+ibis`, `fix(parse_sql): type decimal literals like engines` (B3), `fix(parse_sql): accept COUNT(1)
+and a bare OVER ()` (B4), `fix(ir): do not merge filters that hold a subquery`, `fix(decompile):
+render set ops, unaries and EXISTS` (B5), `fix(parse_sql): import on sqlglot's declared floor`,
+`ci: run the parse_sql tests at both sqlglot bounds` (B1). Every fix has a case in the gate
+(`CASES`, `UNSUPPORTED`, `INVALID`, `roundtrip_cases` or `test_rewrites.py`) that failed before it.
+Scope, anchor, aggregate-memo and hoisting rules untouched.
+
+| | before (review 2) | after |
+|---|---|---|
+| Gate (pixi, sqlglot 28.8) | 611 passed, 18 xfailed | 672 passed, 18 xfailed |
+| `PARSE_SQL_BATTERY.py` | ok=176 wrong=1 error=7 | ok=176 wrong=1 error=7 (unchanged: the decimal AVG and the seven deliberate raises) |
+| `battery2.py parse` (ok / wrong / kind / ugly / raise) | 283 / 16 / 2 / 5 / 52 | 298 / 4 / 2 / 0 / 54 |
+| `battery2.py roundtrip` | 269 / 18 / 2 / 11 / 52, 6 renamed columns | 298 / 4 / 2 / 0 / 54, 0 renamed |
+| Wider suites (`ibis/backends/tests/sql ibis/expr/tests ibis/tests/expr`) | 3310 passed with 3 snapshots deselected | 3323 passed, 1 skipped, 3 xfailed, nothing deselected |
+| Gate at sqlglot 27.29.0 / 30.24.0 | 27.29 ok; 30.24 TPC-H q13 and q16 wrong | 672 passed, 18 xfailed at both |
+| Gate at sqlglot 23.6.3 (the floor of `>=23.4`) | `import ibis` fails | 633 passed, 39 skipped, 18 xfailed; TPC-H 22/22 |
+
+The four remaining `battery2` wrongs are the three decimal-typing cases (`p * q`, `SUM(p * q)`,
+`AVG(p)`: the B5 issue to file) and `SUBSTRING(b, a - 1, 1)`, a computed start before 1, which
+the docstring now documents as following Ibis. The two extra raises are `LENGTH(NULL)` and
+`SUM((SELECT COUNT(*) ...))`, now `IbisInputError` instead of `AttributeError`.
+
+**What each fix did beyond the review's one-liner.**
+
+- B2: sqlglot 30.8 parses `NOT LIKE` as `Like(negate=True)`; the rule reads the arg, which is
+  absent before. `main`'s lock is past 30.8, so this would have shown up in CI.
+- B3 decimals: a literal with a decimal point is `Decimal` typed by its digits (`1.10` is
+  `decimal(3, 2)`), an exponent form stays float. Two typing rules came with it, in
+  `_align_numeric`: float with decimal computes in float (Ibis ranks float64 below decimal, so
+  `c * 0.5` on a float column would be narrowed on fetch), and two decimals Ibis cannot rank
+  (`decimal(38, 2) * 0.0001000000`, which raised "Cannot compute precedence" in TPC-H q11 and
+  TPC-DS 11, 12, 31, 36, 98) widen the narrower one to the wider precision and scale.
+- B3 windows: a named window is merged with the inline parts (`OVER (w ORDER BY a)`); adding a
+  PARTITION BY, a second ORDER BY or a frame over a named window that has one is `IbisInputError`,
+  as in DuckDB and PostgreSQL (three `INVALID` cases).
+- B4: `NTILE(n) OVER ()` translates, but its decompile round trip failed twice in this session
+  with `SignatureValidationError ... order_by=(y,)` from `Value.over`, and 32 later runs of the same
+  expression (16 fixed hash seeds, worktree and `main`) could not reproduce it. Left out of the
+  `ranking_empty_window` case; worth an issue if it recurs.
+- B5 literals: the decompiler now keeps `ibis.literal(...)` for any literal on the left of an
+  infix operator (a plain value folds with a plain right operand, or swaps operands through the
+  reflected operator), and a typed literal is never spliced bare (`('0.2', 'decimal' * t.a)` was
+  the pre-existing rendering). `test_basic`'s `three`/`nine` now expect the expressions, and the
+  TPC-H q03 snapshot gains `ibis.literal(1)`.
+- B5 EXISTS: `decompile()` records, per `ExistsSubquery`, the parent of the Filter or Project whose
+  values hold it; `(pred).any()` is rendered only when the predicates span exactly the inner relation
+  and that parent and hold no subquery of their own, else `(rel.count() > 0)`. Nested EXISTS and
+  the CTE self-EXISTS round-trip. `subsequent_filters` leaves a filter alone when a predicate holds
+  a subquery. The first review's `InSubquery` fallback (replacing the `keep` context) is not done:
+  it changes `ops.InSubquery` and the compilers' handling of a bare-table subquery, outside this
+  session's list.
+- B5 set ops / unaries: `distinct=` is rendered when it differs from the method's default
+  (`union` False, `intersect`/`difference` True); `~x` and `-x` render parenthesized like binary
+  operators, so every method call on them (`.name`, `.fill_null`) binds right. The three snapshots
+  that the branch's earlier decompile commits left stale are regenerated in the same commit.
+- B1: the five ranking classes and `SplitPart` are registered by name where `sge` has them (no
+  version compared). sqlglot 23.6.3 also drops `* REPLACE` in `qualify` (a silent wrong column),
+  so a probe at import checks whether `qualify` applies REPLACE and `parse_sql` rejects it where
+  not. The CI job `test_sqlglot_bounds` (`ibis-main.yml`) locks sqlglot at the floor resolved from
+  the pyproject spec (`uv pip compile --resolution lowest-direct`, 23.6.3 today) and at the latest
+  release, downloads the test data and runs the gate. The two gate modules skip, below 27.11, what
+  the oldest releases cannot parse or qualify (ranking functions, STRPOS, SPLIT_PART, LTRIM,
+  STRING_AGG with a separator, SEMI/ANTI joins, `* REPLACE`, five unsupported-syntax cases, TPC-DS
+  36, 44, 47, 49, 57); `parse_sql` raises for every one of them there, nothing is silently wrong.
+  The 27.11 boundary is where the ranking classes appear; the other items' boundaries were not
+  bisected. The job has not run in GitHub Actions yet; its `uv lock --upgrade-package` steps were
+  tried locally on a copy of the project.
+
+**Still open for the PR split (B6):** drop the `chore(sql)` commits, the `PARSE_SQL_*` files and
+the battery scripts; the review's PR order; file the B5 issues (decimal typing with the
+`to_pyarrow` repro, the `merge_select_select` alias, `Join.select`, `aggregate(having=)`,
+int32 subquery comparability). Section 4 of review 2 (missing everyday functions) was out of
+scope and is unchanged.
