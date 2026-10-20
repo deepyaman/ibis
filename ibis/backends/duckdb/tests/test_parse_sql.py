@@ -135,6 +135,9 @@ CASES = {
     "comma_join_where_or": "SELECT t.a FROM t, u WHERE (t.a = u.a AND t.c > 1) OR (t.a = u.a + 1 AND t.c < 1)",
     "left_join_filter_right": "SELECT t.a FROM t LEFT JOIN u ON t.a = u.a WHERE u.x = 'p'",
     "named_window": "SELECT a, SUM(c) OVER w AS s FROM t WINDOW w AS (PARTITION BY b ORDER BY a)",
+    "named_window_extended": "SELECT a, SUM(c) OVER (w ORDER BY a) AS s, SUM(c) OVER (w2 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s2 FROM t WINDOW w AS (PARTITION BY b), w2 AS (PARTITION BY b ORDER BY a)",
+    "window_frame_start_only": "SELECT a, SUM(c) OVER (ORDER BY a ROWS 1 PRECEDING) AS s1, SUM(c) OVER (ORDER BY a RANGE UNBOUNDED PRECEDING) AS s2, SUM(c) OVER (ORDER BY a ROWS CURRENT ROW) AS s3 FROM t",
+    "window_filter_default_frame": "SELECT a, SUM(c) FILTER (WHERE a > 1) OVER (ORDER BY a) AS s FROM t",
     "count_star_window_group": "SELECT a, COUNT(*) OVER () AS n FROM t GROUP BY a",
     "filter_where_agg": "SELECT SUM(c) FILTER (WHERE a > 1) AS s FROM t",
     "any_subquery": "SELECT a FROM t WHERE a = ANY (SELECT a FROM u)",
@@ -259,6 +262,18 @@ INVALID = {
     "window_in_having": (
         "SELECT a FROM t GROUP BY a HAVING ROW_NUMBER() OVER () = 1",
         "not allowed in HAVING",
+    ),
+    "named_window_repartitioned": (
+        "SELECT SUM(c) OVER (w PARTITION BY a) FROM t WINDOW w AS (PARTITION BY b)",
+        "PARTITION BY",
+    ),
+    "named_window_reordered": (
+        "SELECT SUM(c) OVER (w ORDER BY a) FROM t WINDOW w AS (ORDER BY c)",
+        "ORDER BY",
+    ),
+    "named_window_reframed": (
+        "SELECT SUM(c) OVER (w ROWS CURRENT ROW) FROM t WINDOW w AS (ORDER BY a ROWS 1 PRECEDING)",
+        "frame",
     ),
     "nested_aggregate": ("SELECT SUM(MAX(c)) FROM t", "nested"),
     "column_outside_group_by": ("SELECT a, b FROM t GROUP BY a", "GROUP BY"),

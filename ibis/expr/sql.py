@@ -1158,37 +1158,58 @@ def _window_bound(value, side):
     return -offset if (side or "").upper() == "PRECEDING" else offset
 
 
+def _window_parts(window, scope):
+    """The PARTITION BY, ORDER BY and frame of ``window``.
+
+    ``OVER w`` takes all three from the WINDOW clause; ``OVER (w ...)`` may add
+    an ORDER BY and a frame to a named window that has none, not a partition.
+    """
+    parts = {name: window.args.get(name) for name in ("partition_by", "order", "spec")}
+    if (alias := window.args.get("alias")) is None:
+        return parts
+    if (named := scope.windows.get(alias.name)) is None:
+        raise _unsupported(window, scope, f"The window {alias.name!r}")
+    if parts["partition_by"]:
+        raise _invalid(
+            window, scope, f"Cannot override the PARTITION BY of {alias.name!r}"
+        )
+    if any(parts.values()) and named.args.get("spec") is not None:
+        raise _invalid(
+            window, scope, f"Cannot extend the window {alias.name!r}: it has a frame"
+        )
+    if parts["order"] is not None and named.args.get("order") is not None:
+        raise _invalid(window, scope, f"Cannot override the ORDER BY of {alias.name!r}")
+    return {name: part or named.args.get(name) for name, part in parts.items()}
+
+
 @_convert.register(sge.Window)
 def convert_window(window, scope):
-    source = window
-    if (alias := window.args.get("alias")) is not None and not (
-        window.args.get("partition_by")
-        or window.args.get("order")
-        or window.args.get("spec")
-    ):
-        # ``OVER w`` refers to the WINDOW clause
-        if (source := scope.windows.get(alias.name)) is None:
-            raise _unsupported(window, scope, f"The window {alias.name!r}")
+    parts = _window_parts(window, scope)
     func = convert(window.this, scope=scope)
-    group_by = [
-        convert(part, scope=scope) for part in source.args.get("partition_by") or ()
-    ]
+    group_by = [convert(part, scope=scope) for part in parts["partition_by"] or ()]
     order_by = []
-    if (order := source.args.get("order")) is not None:
+    if (order := parts["order"]) is not None:
         order_by = [convert(key, scope=scope) for key in order.expressions]
 
     kwargs = {}
-    if (spec := source.args.get("spec")) is not None:
+    if (spec := parts["spec"]) is not None:
         if spec.args.get("exclude"):
             raise _unsupported(window, scope, "A window frame with EXCLUDE")
         start = _window_bound(spec.args.get("start"), spec.args.get("start_side"))
-        end = _window_bound(spec.args.get("end"), spec.args.get("end_side"))
+        if (end := spec.args.get("end")) is None:
+            # ``ROWS 1 PRECEDING`` names the start only; the end is the current row
+            end = 0
+        else:
+            end = _window_bound(end, spec.args.get("end_side"))
         kind = (spec.args.get("kind") or "ROWS").upper()
         kwargs["rows" if kind == "ROWS" else "range"] = (start, end)
-    elif order_by and isinstance(window.this, sge.AggFunc):
-        # SQL's default frame for an ordered aggregate window ends at the
-        # current row (and its peers); Ibis's default is the whole partition
-        kwargs["range"] = (None, 0)
+    else:
+        # a FILTER wraps the aggregate the window applies to
+        this = window.this.this if isinstance(window.this, sge.Filter) else window.this
+        if order_by and isinstance(this, sge.AggFunc):
+            # SQL's default frame for an ordered aggregate window ends at the
+            # current row (and its peers); Ibis's default is the whole partition
+            kwargs["range"] = (None, 0)
 
     return func.over(ibis.window(group_by=group_by, order_by=order_by, **kwargs))
 
