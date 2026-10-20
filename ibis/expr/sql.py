@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import operator
+import re
 from dataclasses import dataclass, field
 from functools import singledispatch
 
@@ -21,6 +22,7 @@ import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.sql.datatypes import SqlglotType
+from ibis.common.annotations import ValidationError
 from ibis.util import experimental
 
 # The optimizer rules run before conversion. ``qualify`` resolves every column
@@ -179,9 +181,53 @@ class Scope:
 def _unsupported(node, scope, what=None):
     dialect = scope.root.dialect if scope is not None else None
     sql = node.sql(dialect=dialect) if isinstance(node, sge.Expression) else str(node)
-    return com.UnsupportedOperationError(
-        f"{what or type(node).__name__} is not supported: {sql}"
-    )
+    if what is None:
+        what = type(node).__name__
+        if isinstance(node, sge.Func) and (call := re.match(r"[\w.]+(?=\()", sql)):
+            what = f"The function {call.group()}"
+    return com.UnsupportedOperationError(f"{what} is not supported: {sql}")
+
+
+def _invalid(node, scope, why):
+    """The SQL is not valid, or not translatable, for a reason Ibis found."""
+    sql = node.sql(dialect=scope.root.dialect)
+    return com.IbisInputError(f"{why}: {sql}")
+
+
+def _boolean(node, scope):
+    """Convert a condition; SQL implies a boolean where Ibis requires one."""
+    value = convert(node, scope)
+    if not value.type().is_boolean():
+        raise _invalid(node, scope, f"The condition is {value.type()}, not boolean")
+    return value
+
+
+def _reject_aggregates(nodes, scope, clause, *, aggregates=True) -> None:
+    """Window functions, and ``aggregates`` too, are not allowed in ``clause``."""
+    for root in nodes:
+        for node in root.walk(
+            prune=lambda n, root=root: (
+                n is not root and isinstance(n, (sge.Select, sge.Subquery))
+            )
+        ):
+            if isinstance(node, sge.Window):
+                raise _invalid(
+                    node, scope, f"A window function is not allowed in {clause}"
+                )
+            if (
+                aggregates
+                and isinstance(node, sge.AggFunc)
+                and not _is_window_function(node)
+            ):
+                raise _invalid(
+                    node, scope, f"An aggregate function is not allowed in {clause}"
+                )
+
+
+def _is_window_function(node) -> bool:
+    """Whether an aggregate call is the function of a window."""
+    unit = node.parent if isinstance(node.parent, sge.Filter) else node
+    return isinstance(unit.parent, sge.Window) and unit.parent.this is unit
 
 
 def _unparen(node):
@@ -346,7 +392,8 @@ def _build_from(select, scope):
                 join, scope, "A subquery or outer reference in an outer join condition"
             )
         deferred.extend(late)
-        predicates = [convert(condition, scope) for condition in local]
+        _reject_aggregates(on, scope, "a join condition")
+        predicates = [_boolean(condition, scope) for condition in local]
         rname = "{name}_" + alias
         if predicates:
             rel = rel.join(right, predicates, how=how, rname=rname)
@@ -395,7 +442,7 @@ def _anchor(scope, nodes) -> None:
                 node = node.parent
 
 
-def _metric_units(roots):
+def _metric_units(roots, scope):
     """Aggregate calls of this SELECT (with any FILTER) that are not window functions."""
     units = []
     for root in roots:
@@ -404,12 +451,16 @@ def _metric_units(roots):
                 n is not root and isinstance(n, (sge.Select, sge.Subquery))
             )
         ):
-            if not isinstance(node, sge.AggFunc):
+            if not isinstance(node, sge.AggFunc) or _is_window_function(node):
                 continue
             unit = node.parent if isinstance(node.parent, sge.Filter) else node
-            if isinstance(unit.parent, sge.Window) or unit in units:
-                continue
-            units.append(unit)
+            for inner in unit.walk(
+                prune=lambda n: isinstance(n, (sge.Select, sge.Subquery))
+            ):
+                if inner is not node and isinstance(inner, (sge.AggFunc, sge.Window)):
+                    raise _invalid(unit, scope, "Aggregate functions cannot be nested")
+            if unit not in units:
+                units.append(unit)
     return units
 
 
@@ -519,7 +570,9 @@ def _order_by(order, scope, proj, values, distinct):
         return proj.order_by(keys)
     except com.IntegrityError:
         if distinct:
-            raise
+            raise _unsupported(
+                order, scope, "ORDER BY a column that SELECT DISTINCT does not return"
+            ) from None
     # a sort key the SELECT list does not carry (``SELECT a FROM t ORDER BY
     # c``): sort the projection extended with the keys, then drop them
     names = [value.get_name() for value in values]
@@ -545,7 +598,18 @@ def _limit(node, rel, scope):
     offset = node.args.get("offset")
     if limit is None and offset is None:
         return rel
-    n = None if limit is None else _int(limit.expression, scope)
+    n = None
+    if limit is not None:
+        options = limit.args.get("limit_options")
+        for option in ("percent", "with_ties"):
+            if limit.args.get(option) or (options and options.args.get(option)):
+                raise _unsupported(limit, scope, "LIMIT with PERCENT or WITH TIES")
+        if isinstance(limit, sge.Fetch):
+            # ``FETCH FIRST n ROWS ONLY`` is ``LIMIT n``; without ``n`` it is one row
+            count = limit.args.get("count")
+            n = 1 if count is None else _int(count, scope)
+        else:
+            n = _int(limit.expression, scope)
     return rel.limit(n, offset=0 if offset is None else _int(offset.expression, scope))
 
 
@@ -593,6 +657,8 @@ def _bind_ctes(node, scope) -> None:
     if with_.args.get("recursive"):
         raise _unsupported(with_, scope, "WITH RECURSIVE")
     for cte in with_.expressions:
+        if cte.alias in scope.ctes:
+            raise _invalid(cte, scope, f"The CTE {cte.alias!r} is defined twice")
         table = convert_relation(cte.this, scope.child())
         alias = cte.args.get("alias")
         columns = [column.name for column in alias.columns] if alias is not None else []
@@ -624,13 +690,16 @@ def convert_select(select, scope, *, projection=True, elide=True):
     scope.windows = {
         window.this.name: window for window in select.args.get("windows") or ()
     }
+    _reject_aggregates(_conjuncts(select.args.get("where")), scope, "WHERE")
+    if (group := select.args.get("group")) is not None:
+        _reject_aggregates(group.expressions, scope, "GROUP BY")
     rel, conditions = _build_from(select, scope)
     if rel is None:
         return _convert_from_less(select, scope)
     if conditions:
         _anchor(scope, conditions)
         scope.rebind(
-            scope.rel.filter([convert(condition, scope) for condition in conditions])
+            scope.rel.filter([_boolean(condition, scope) for condition in conditions])
         )
 
     items = [
@@ -644,12 +713,13 @@ def convert_select(select, scope, *, projection=True, elide=True):
         roots.append(having.this)
     if order is not None:
         roots.extend(key.this for key in order.expressions)
-    units = _metric_units(roots)
-    if select.args.get("group") is not None or units:
+    units = _metric_units(roots, scope)
+    if group is not None or units:
         _aggregate(select, scope, units)
     if having is not None:
+        _reject_aggregates([having.this], scope, "HAVING", aggregates=False)
         _anchor(scope, [having.this])
-        scope.rebind(scope.rel.filter(convert(having.this, scope)))
+        scope.rebind(scope.rel.filter(_boolean(having.this, scope)))
     if not projection:
         return scope.rel
 
@@ -677,7 +747,7 @@ def _convert_from_less(select, scope):
     rel = ops.DummyTable(values).to_expr()
     scope.rebind(rel)
     if where := _conjuncts(select.args.get("where")):
-        rel = rel.filter([convert(condition, scope) for condition in where])
+        rel = rel.filter([_boolean(condition, scope) for condition in where])
     if (order := select.args.get("order")) is not None:
         columns = [rel[name] for name in rel.columns]
         rel = _order_by(order, scope, rel, columns, distinct=False)
@@ -716,8 +786,18 @@ def convert_set_operation(setop, scope):
         raise _unsupported(setop, scope)
     left = convert_relation(setop.left, scope.child())
     right = convert_relation(setop.right, scope.child())
+    if len(left.columns) != len(right.columns):
+        raise _invalid(
+            setop,
+            scope,
+            f"The sides of the set operation return {len(left.columns)} "
+            f"and {len(right.columns)} columns",
+        )
     if left.schema() != right.schema():
-        left, right = _align_set_operands(left, right)
+        try:
+            left, right = _align_set_operands(left, right)
+        except com.IbisTypeError as e:
+            raise _invalid(setop, scope, f"Cannot align the sides: {e}") from e
     table = getattr(left, method)(right, distinct=bool(setop.args.get("distinct")))
 
     if (order := setop.args.get("order")) is not None:
@@ -738,7 +818,11 @@ def convert(node, scope):
     if scope.agg is not None and (name := scope.agg.memo.get(node)) is not None:
         # an aggregate or GROUP BY expression computed by the aggregate
         return scope.rel[name]
-    return _convert(node, scope)
+    try:
+        return _convert(node, scope)
+    except (TypeError, ValidationError) as e:
+        # Ibis rejected the operands; say which SQL they came from
+        raise _invalid(node, scope, f"Cannot translate ({e})") from e
 
 
 @_convert.register(sge.Subquery)
@@ -916,6 +1000,8 @@ def convert_ilike(like, scope):
 
 @_convert.register(sge.Between)
 def convert_between(between, scope):
+    if between.args.get("symmetric"):
+        raise _unsupported(between, scope, "BETWEEN SYMMETRIC")
     this = convert(between.this, scope=scope)
     low = convert(between.args["low"], scope=scope)
     high = convert(between.args["high"], scope=scope)
@@ -1077,6 +1163,8 @@ def convert_window(window, scope):
 
     kwargs = {}
     if (spec := source.args.get("spec")) is not None:
+        if spec.args.get("exclude"):
+            raise _unsupported(window, scope, "A window frame with EXCLUDE")
         start = _window_bound(spec.args.get("start"), spec.args.get("start_side"))
         end = _window_bound(spec.args.get("end"), spec.args.get("end_side"))
         kind = (spec.args.get("kind") or "ROWS").upper()
@@ -1107,8 +1195,7 @@ _truncation_units = {
 @_convert.register(sge.DateTrunc)
 def convert_truncate(trunc, scope):
     this = convert(trunc.this, scope=scope)
-    unit = trunc.args["unit"].name.lower().removesuffix("s")
-    return this.truncate(_truncation_units[unit])
+    return this.truncate(_unit(trunc.args.get("unit"), _truncation_units, trunc, scope))
 
 
 @_convert.register(sge.Round)
@@ -1194,7 +1281,11 @@ def convert_dpipe(func, scope):
 
 @_convert.register(sge.Trim)
 def convert_trim(func, scope):
-    return convert(func.this, scope=scope).strip()
+    if func.expression is not None:
+        raise _unsupported(func, scope, "TRIM of specific characters")
+    this = convert(func.this, scope=scope)
+    position = (func.args.get("position") or "BOTH").upper()
+    return {"LEADING": this.lstrip, "TRAILING": this.rstrip}.get(position, this.strip)()
 
 
 @_convert.register(sge.Initcap)
@@ -1216,6 +1307,8 @@ def convert_count(count, scope):
     if this is None or isinstance(this, sge.Star):
         return scope.rel.count() if scope.rel is not None else ibis._.count()
     if isinstance(this, sge.Distinct):
+        if len(this.expressions) != 1:
+            raise _unsupported(count, scope, "COUNT(DISTINCT) of several expressions")
         (this,) = this.expressions
         return convert(this, scope=scope).nunique()
     return convert(this, scope=scope).count()
@@ -1396,12 +1489,19 @@ _interval_units = {
 }
 
 
+def _unit(node, units, parent, scope):
+    """The Ibis unit for a date or interval unit of the SQL."""
+    if node is None or (unit := units.get(node.name.lower().removesuffix("s"))) is None:
+        raise _unsupported(parent, scope, f"The unit {getattr(node, 'name', None)!r}")
+    return unit
+
+
 @_convert.register(sge.DateAdd)
 @_convert.register(sge.DateSub)
 def convert_date_add(func, scope):
     this = convert(func.this, scope=scope)
     unit = func.args.get("unit")
-    unit = "D" if unit is None else _interval_units[unit.name.lower().removesuffix("s")]
+    unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
     if isinstance(func.expression, sge.Literal):
         interval = ibis.interval(int(func.expression.name), unit)
     else:
@@ -1411,7 +1511,7 @@ def convert_date_add(func, scope):
 
 @_convert.register(sge.Interval)
 def convert_interval(interval, scope):
-    unit = _interval_units[interval.args["unit"].name.lower().removesuffix("s")]
+    unit = _unit(interval.args.get("unit"), _interval_units, interval, scope)
     if isinstance(interval.this, sge.Literal):
         return ibis.interval(int(interval.this.name), unit)
     return convert(interval.this, scope=scope).as_interval(unit)
@@ -1470,7 +1570,19 @@ def parse_sql(sqlstring, catalog, dialect=None):
         {name: ibis.table(schema, name=name) for name, schema in catalog.items()}
     )
 
-    expr = sg.parse_one(sqlstring, dialect)
+    try:
+        statements = [s for s in sg.parse(sqlstring, dialect) if s is not None]
+    except sg.errors.ParseError as e:
+        raise com.IbisInputError(f"Cannot parse the SQL: {e}") from e
+    if len(statements) != 1:
+        raise com.IbisInputError(
+            f"parse_sql takes one statement, {len(statements)} were given"
+        )
+    (expr,) = statements
+    known = set(catalog) | {cte.alias for cte in expr.find_all(sge.CTE)}
+    for table in expr.find_all(sge.Table):
+        if isinstance(table.this, sge.Identifier) and table.name not in known:
+            raise com.IbisInputError(f"Table {table.name!r} is not in the catalog")
     try:
         tree = sgo.optimize(
             expr,

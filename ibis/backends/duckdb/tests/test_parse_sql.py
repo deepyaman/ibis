@@ -153,6 +153,11 @@ CASES = {
     "split_part": "SELECT SPLIT_PART(b, 'a', 1) AS p1, SPLIT_PART(b, 'a', 2) AS p2 FROM t",
     "regexp_matches": "SELECT a FROM t WHERE REGEXP_MATCHES(b, '^ba')",
     "select_without_from_order_by": "SELECT 2 AS two, 1 AS one ORDER BY one",
+    "trim_sides": "SELECT LTRIM('  x ') AS l, RTRIM('  x ') AS r, TRIM(LEADING FROM ' y ') AS tl, TRIM(TRAILING FROM ' y ') AS tt, TRIM(b) AS b FROM t",
+    "fetch_first": "SELECT a FROM t ORDER BY a FETCH FIRST 2 ROWS ONLY",
+    "window_partition_by_aggregate": "SELECT a, SUM(c) AS s, COUNT(*) OVER (PARTITION BY SUM(c) > 2) AS n FROM t GROUP BY a",
+    "having_without_group_by": "SELECT SUM(c) AS s FROM t HAVING SUM(c) > 1",
+    "star_exclude_replace": "SELECT * EXCLUDE (ts) REPLACE (a + 1 AS a) FROM t",
 }
 
 UNSUPPORTED = {
@@ -192,6 +197,77 @@ UNSUPPORTED = {
     "split_part_zero": ("SELECT SPLIT_PART(b, 'a', 0) FROM t", "SPLIT_PART"),
     "extract_decade": ("SELECT EXTRACT(decade FROM d) FROM t", "(?i)decade"),
     "regexp_flags": ("SELECT REGEXP_MATCHES(b, 'A', 'i') FROM t", "(?i)flags"),
+    "trim_characters": ("SELECT TRIM('f' FROM b) FROM t", "TRIM"),
+    "limit_percent": ("SELECT a FROM t LIMIT 10%", "PERCENT"),
+    "fetch_with_ties": (
+        "SELECT a FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES",
+        "TIES",
+    ),
+    "window_exclude": (
+        "SELECT SUM(c) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t",
+        "EXCLUDE",
+    ),
+    "count_distinct_two": ("SELECT COUNT(DISTINCT a, b) FROM t", "COUNT"),
+    "between_symmetric": (
+        "SELECT a FROM t WHERE a BETWEEN SYMMETRIC 2 AND 1",
+        "SYMMETRIC",
+    ),
+    "interval_unit": ("SELECT d + INTERVAL '1' FORTNIGHT FROM t", "(?i)fortnight"),
+    "interval_without_unit": ("SELECT d + INTERVAL '1 day 2 hours' FROM t", "(?i)unit"),
+    "date_trunc_unit": ("SELECT DATE_TRUNC('decade', d) FROM t", "(?i)decade"),
+    "distinct_order_by_other": ("SELECT DISTINCT a FROM t ORDER BY c", "DISTINCT"),
+    "collate": ("SELECT a FROM t WHERE b COLLATE NOCASE = 'X'", "(?i)collate"),
+    "like_escape": ("SELECT a FROM t WHERE b LIKE 'x%' ESCAPE 'x'", "(?i)escape"),
+    "bitwise_and": ("SELECT a & 1 FROM t", "(?i)bitwise"),
+    "parameter": ("SELECT a FROM t WHERE b = $1", "(?i)placeholder"),
+    "insert": ("INSERT INTO t VALUES (1)", "(?i)insert"),
+}
+
+# SQL that is invalid, or that Ibis cannot type, raises an input error
+INVALID = {
+    "unknown_column": ("SELECT zzz FROM t", "zzz"),
+    "unknown_table": ("SELECT a FROM nope", "nope"),
+    "ambiguous_column": ("SELECT a FROM t JOIN u ON t.a = u.a", "'a'"),
+    "duplicate_alias": ("SELECT * FROM t AS x, u AS x", "x"),
+    "duplicate_cte": (
+        "WITH x AS (SELECT 1 AS a), x AS (SELECT 2 AS a) SELECT a FROM x",
+        "defined twice",
+    ),
+    "aggregate_in_where": ("SELECT a FROM t WHERE SUM(c) > 1", "not allowed in WHERE"),
+    "window_in_where": (
+        "SELECT a FROM t WHERE ROW_NUMBER() OVER () = 1",
+        "not allowed in WHERE",
+    ),
+    "aggregate_in_group_by": (
+        "SELECT a FROM t GROUP BY SUM(c)",
+        "not allowed in GROUP BY",
+    ),
+    "aggregate_in_join": (
+        "SELECT t.a FROM t JOIN u ON t.a = MAX(u.a)",
+        "not allowed in a join condition",
+    ),
+    "window_in_having": (
+        "SELECT a FROM t GROUP BY a HAVING ROW_NUMBER() OVER () = 1",
+        "not allowed in HAVING",
+    ),
+    "nested_aggregate": ("SELECT SUM(MAX(c)) FROM t", "nested"),
+    "column_outside_group_by": ("SELECT a, b FROM t GROUP BY a", "GROUP BY"),
+    "set_operation_widths": (
+        "SELECT a FROM t UNION SELECT a, x FROM u",
+        "1 and 2 columns",
+    ),
+    "set_operation_types": ("SELECT a FROM t UNION SELECT x FROM u", "Cannot align"),
+    "scalar_subquery_width": (
+        "SELECT a FROM t WHERE a = (SELECT a, x FROM u)",
+        "one column",
+    ),
+    "incomparable_types": ("SELECT a FROM t WHERE a = 'x'", "t.a = 'x'"),
+    "string_arithmetic": ("SELECT a + b FROM t", r"t.a \+ t.b"),
+    "where_not_boolean": ("SELECT a FROM t WHERE b", "not boolean"),
+    "join_not_boolean": ("SELECT t.a FROM t JOIN u ON u.x", "not boolean"),
+    "syntax_error": ("SELEC a FROM t", "Cannot parse"),
+    "two_statements": ("SELECT a FROM t; SELECT a FROM u", "one statement"),
+    "empty": ("", "one statement"),
 }
 
 
@@ -222,6 +298,13 @@ def test_decompile_roundtrip_matches_duckdb(duck, sql):
 def test_parse_sql_unsupported(sql, message):
     """SQL `parse_sql` cannot translate raises instead of dropping a clause."""
     with pytest.raises(com.UnsupportedOperationError, match=message):
+        ibis.parse_sql(sql, CATALOG, dialect="duckdb")
+
+
+@pytest.mark.parametrize(("sql", "message"), list(INVALID.values()), ids=list(INVALID))
+def test_parse_sql_invalid(sql, message):
+    """Invalid SQL raises an input error that names the offending SQL."""
+    with pytest.raises(com.IbisInputError, match=message):
         ibis.parse_sql(sql, CATALOG, dialect="duckdb")
 
 
