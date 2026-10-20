@@ -248,3 +248,69 @@ sqlglot's `qualify`; every rescan of a table or CTE is a `.view()` (TPC-DS scans
 times); `parse_sql` without `dialect` parses `ORDER BY x` as NULLS FIRST (sqlglot's generic default),
 so pass the dialect; the `.select(<all columns>)` after each join in decompiled output is the
 decompiler rendering the chain's own values, not a projection the converter adds.
+
+## Phase B, session 1: B3, B1, B2 (2026-10-20)
+
+**Commits.** `test(duckdb): tighten the parsed SQL result checks` (B3),
+`feat(parse_sql): complete the everyday value layer` (B1), `fix(parse_sql): reject invalid and
+unsupported SQL` (B2). Gate after each: 514, 558 and 605 passed, 18 xfailed (504 + the tests added).
+Scope, anchor, aggregate-memo and hoisting rules untouched. Two decompiler files changed in B1 and B2
+(`ibis/expr/decompile.py`: rendering rules for `delta`, `identical_to`, `day_of_week.index()`,
+`find`, `split`, `lstrip`/`rstrip`, array indexing, `//`, `ibis.today()`); B4 may split them into
+the decompile PR.
+
+**B3, what the strict comparator showed.** `ibis/tests/util.py` now holds `decompile_roundtrip`,
+`expose_sort_keys` and `assert_same_result`. Rows are compared in order under a top-level ORDER BY
+(ties free; the keys are appended to the SQL DuckDB runs, or taken from the output for set
+operations and `SELECT *` ordinals), names case-insensitively except `_col_N`, value kinds, and
+values exactly (floats to 1e-9). The everyday suite is exact in both modes. The only difference in
+the TPC suites is **decimal typing**, and it is wider than `ops.Mean`:
+
+- `AVG(decimal(p, s))` is typed `decimal(p, s)` (TPC-H 1; TPC-DS 7, 9, 13, 26, 27, 28, 47, 53, 57,
+  63, 89, the last three through `AVG(...) OVER`).
+- `decimal(15, 2) * decimal(15, 2)` is typed `decimal(15, 2)` (`highest_precedence`), so
+  `SUM(l_extendedprice * (1 - l_discount))` is `decimal(38, 2)` where DuckDB computes
+  `DECIMAL(38, 4)` (TPC-H 3, 9, 10, 15, 19).
+- Both are rounded to the declared scale by `PandasData.convert_Decimal` on `to_pandas`, and
+  **`to_pyarrow` raises** `ArrowInvalid: Rescaling Decimal value would cause data loss` on the same
+  expressions (repro: `t = ibis.table({"p": "decimal(15, 2)", "d": "decimal(15, 2)"}, name="t")`,
+  `con.to_pyarrow(t.aggregate(s=(t.p * (1 - t.d)).sum()))` on DuckDB with a few rows).
+
+The 17 queries are marked in `TPCH_NARROW_DECIMAL_QUERIES` / `TPCDS_NARROW_DECIMAL_QUERIES`
+(`test_decompile_tpch.py`); `narrow_decimals=True` admits half a unit of the last place on those
+columns and fails if none deviates any more. **B5 action:** file the issue (Mean typing *and* decimal
+multiply scale, with the `to_pyarrow` repro) and put its number in the comment above those sets.
+
+**B1.** EXTRACT dow/isodow/doy/week/epoch (+ DATE_PART), IS [NOT] DISTINCT FROM (also as a join
+key; `x IS NOT DISTINCT FROM NULL` keeps its meaning), STRING_AGG (+ ORDER BY), BOOL_OR/BOOL_AND,
+`//`, DATE_DIFF, CURRENT_DATE/CURRENT_TIMESTAMP/NOW/TODAY, EXP/LOG (bare LOG is base 10: sqlglot
+parses it as LN where the dialect says so), POSITION/STRPOS, SPLIT_PART (SQL's `''` past the last
+part, via `ifelse`), REGEXP_MATCHES, CONCAT NULL handling from sqlglot's `coalesce` flag (the `safe`
+flag the converter read is set for every dialect), SUBSTRING rejects a literal start < 1, ORDER BY on
+a FROM-less SELECT is kept. Known: `dow` numbering is Postgres/DuckDB's (Sunday 0).
+
+**B2.** Silent misreads fixed by raising: aggregate in WHERE (was a whole-table scalar subquery),
+window in WHERE/HAVING, `LIMIT n%`, set-operation sides of different widths (were zipped), TRIM of
+characters, LTRIM/RTRIM (now `lstrip`/`rstrip`), BETWEEN SYMMETRIC, window `EXCLUDE`, several
+statements (`parse_one` kept the first). Type errors from Ibis are `IbisInputError` naming the
+fragment (`convert` wraps `TypeError`/`ValidationError`; WHERE/HAVING/ON go through `_boolean`).
+Unknown units, nested aggregates, duplicate CTEs, unknown tables, parse errors: all
+`IbisInputError`/`UnsupportedOperationError`. `_metric_units` now treats only the function of a
+window as a window function (an aggregate inside PARTITION BY is a metric). `test_parse_sql_invalid`
+(22) and `test_parse_sql_unsupported` (34) pin the messages.
+
+**For B4 (sqlglot floor).** Classes registered at import since Phase A: `sge.SplitPart`,
+`LogicalOr`, `LogicalAnd`, `NullSafeEQ`, `NullSafeNEQ`, `IntDiv`, `DateDiff`, `CurrentDate`,
+`CurrentTimestamp`, `StrPosition`, `RegexpLike`, `Exp`, `Log`, `GroupConcat`, `Anonymous`, `Fetch`
+(isinstance only). Args read by name: `Limit.limit_options`, `WindowSpec.exclude`,
+`RegexpLike.flag`, `Concat.coalesce`, `Between.symmetric`, `Trim.position`.
+
+**Pre-existing, outside the gate.** Three decompile snapshots under `ibis/backends/tests/sql/`
+fail on the branch independent of this session (`test_compiler.py::test_table_drop_with_filter`,
+`test_select_sql.py::test_where_analyze_scalar_op`, `::test_join_between_joins`: interval units and
+join-chain rendering changed by the decompile commits); regenerate them in the decompile PR.
+
+**Edge kept as a loud failure.** In an aggregate query, a window function whose argument is
+structurally equal to a metric (`SUM(a) AS s, SUM(a) OVER () ... GROUP BY a`) hits the memo and
+raises `IbisInputError` ("No reduction or analytic function ...") rather than translating; valid but
+rare SQL, left for the memo's owner.
