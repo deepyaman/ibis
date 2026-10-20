@@ -158,6 +158,8 @@ CASES = {
     "window_partition_by_aggregate": "SELECT a, SUM(c) AS s, COUNT(*) OVER (PARTITION BY SUM(c) > 2) AS n FROM t GROUP BY a",
     "having_without_group_by": "SELECT SUM(c) AS s FROM t HAVING SUM(c) > 1",
     "star_exclude_replace": "SELECT * EXCLUDE (ts) REPLACE (a + 1 AS a) FROM t",
+    "exists_uncorrelated": "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)",
+    "exists_uncorrelated_rescan": "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM t AS t2)",
 }
 
 UNSUPPORTED = {
@@ -172,7 +174,9 @@ UNSUPPORTED = {
         "SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))",
         "GROUPING SETS",
     ),
-    "natural_join": ("SELECT * FROM t NATURAL JOIN u", "(?i)join"),
+    "natural_join": ("SELECT * FROM t NATURAL JOIN u", "NATURAL join"),
+    "natural_join_columns": ("SELECT a, b, x FROM t NATURAL JOIN u", "NATURAL join"),
+    "asof_join": ("SELECT t.a FROM t ASOF JOIN u ON t.a >= u.a", "ASOF join"),
     "lateral": (
         "SELECT t.a, l.z FROM t, LATERAL (SELECT t.a + 1 AS z) AS l",
         "(?i)lateral",

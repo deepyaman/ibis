@@ -838,6 +838,10 @@ def convert_subquery(subquery, scope):
 @_convert.register(sge.Exists)
 def convert_exists(exists, scope):
     rel = convert_relation(exists.this, scope.child(), projection=False)
+    if isinstance(rel.op(), (ops.PhysicalTable, ops.Reference)):
+        # the compiler puts the subquery's SELECT inside EXISTS; a bare table
+        # has none
+        rel = rel.select(rel.columns)
     return ops.ExistsSubquery(rel.op()).to_expr()
 
 
@@ -1581,10 +1585,15 @@ def parse_sql(sqlstring, catalog, dialect=None):
             f"parse_sql takes one statement, {len(statements)} were given"
         )
     (expr,) = statements
+    scope = Scope(_Root(catalog, dialect))
     known = set(catalog) | {cte.alias for cte in expr.find_all(sge.CTE)}
     for table in expr.find_all(sge.Table):
         if isinstance(table.this, sge.Identifier) and table.name not in known:
             raise com.IbisInputError(f"Table {table.name!r} is not in the catalog")
+    for join in expr.find_all(sge.Join):
+        if join.method:
+            # qualify cannot resolve the columns of these joins; say why first
+            raise _unsupported(join, scope, f"A {join.method} join")
     try:
         tree = sgo.optimize(
             expr,
@@ -1596,7 +1605,7 @@ def parse_sql(sqlstring, catalog, dialect=None):
     except sg.errors.OptimizeError as e:
         raise com.IbisInputError(str(e)) from e
 
-    return convert_relation(tree, Scope(_Root(catalog, dialect)))
+    return convert_relation(tree, scope)
 
 
 class SQLString(str):
