@@ -433,6 +433,11 @@ def cast(op, arg, to):
     return f"{arg}.cast({str(to)!r})"
 
 
+@translate.register(ops.TryCast)
+def try_cast(op, arg, to):
+    return f"{arg}.try_cast({str(to)!r})"
+
+
 @translate.register(ops.Between)
 def between(op, arg, lower_bound, upper_bound):
     return f"{arg}.between({lower_bound}, {upper_bound})"
@@ -472,6 +477,15 @@ _infix_ops = {
     ops.TimestampAdd: "+",
     ops.TimestampSub: "-",
     ops.TimestampDiff: "-",
+    ops.DateAdd: "+",
+    ops.DateSub: "-",
+    ops.DateDiff: "-",
+    ops.TimeAdd: "+",
+    ops.TimeSub: "-",
+    ops.TimeDiff: "-",
+    ops.IntervalAdd: "+",
+    ops.IntervalSubtract: "-",
+    ops.IntervalMultiply: "*",
 }
 
 
