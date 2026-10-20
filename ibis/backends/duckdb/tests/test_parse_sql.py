@@ -56,6 +56,7 @@ CASES = {
     "not_like_join_on": "SELECT t.a, u.x FROM t LEFT JOIN u ON t.a = u.a AND u.x NOT LIKE 'q%'",
     "between": "SELECT a FROM t WHERE a BETWEEN 1 AND 2",
     "coalesce": "SELECT COALESCE(b, 'none') AS b2 FROM t",
+    "concat_ws": "SELECT CONCAT_WS('-', b, 'x') AS s, CONCAT_WS('-', b, NULL, 'y', b) AS s2, CONCAT_WS('-', NULL, NULL) AS s3 FROM t",
     "string_functions": "SELECT UPPER(b) AS ub, LENGTH(b) AS lb, SUBSTRING(b, 1, 2) AS sb FROM t",
     "date_functions": "SELECT EXTRACT(year FROM d) AS y, DATE_TRUNC('month', ts) AS m FROM t",
     "date_arithmetic": "SELECT a FROM t WHERE d >= DATE '2024-02-01' AND d < DATE '2024-02-01' + INTERVAL '1' MONTH",

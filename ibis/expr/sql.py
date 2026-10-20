@@ -1311,6 +1311,19 @@ def convert_concat(func, scope):
     return first
 
 
+@_convert.register(sge.ConcatWs)
+def convert_concat_ws(func, scope):
+    sep, first, *rest = [convert(e, scope=scope) for e in func.expressions]
+    # NULL arguments are skipped, so the separator goes between the arguments
+    # that are present, and the result is '' when none is
+    result = first
+    for arg in rest:
+        result = arg.isnull().ifelse(
+            result, result.isnull().ifelse(arg, result + sep + arg)
+        )
+    return result.fill_null("")
+
+
 @_convert.register(sge.DPipe)
 def convert_dpipe(func, scope):
     return convert(func.this, scope=scope) + convert(func.expression, scope=scope)
