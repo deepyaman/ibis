@@ -176,6 +176,12 @@ CASES = {
     "having_without_group_by": "SELECT SUM(c) AS s FROM t HAVING SUM(c) > 1",
     "star_exclude_replace": "SELECT * EXCLUDE (ts) REPLACE (a + 1 AS a) FROM t",
     "exists_uncorrelated": "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)",
+    "except_all": "SELECT a FROM t EXCEPT ALL SELECT a FROM u",
+    "intersect_all": "SELECT a FROM t INTERSECT ALL SELECT a FROM t",
+    "aliased_negation": "SELECT a, NOT (c > 2) AS x, b IS NOT NULL AS nn, a NOT IN (1, 2) AS ni, -(-a) AS k, (c > 2) IS NOT TRUE AS nt, -2.5 AS neg, NOT EXISTS (SELECT 1 FROM u WHERE u.a = t.a) AS ne FROM t",
+    "cte_self_exists": "WITH x AS (SELECT * FROM t WHERE a > 1) SELECT a FROM x WHERE EXISTS (SELECT 1 FROM x AS x2 WHERE x2.a = x.a AND x2.b <> x.b)",
+    "nested_exists": "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t.a AND EXISTS (SELECT 1 FROM t AS t2 WHERE t2.a = t.a AND t2.c > 2))",
+    "nullif_interval": "SELECT NULLIF(b, 'foo') AS n, d + INTERVAL (a) DAY AS dd FROM t",
     "exists_uncorrelated_rescan": "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM t AS t2)",
 }
 

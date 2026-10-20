@@ -36,11 +36,13 @@ _method_overrides = {
     ops.ExtractWeekOfYear: "week_of_year",
     ops.ExtractYear: "year",
     ops.Intersection: "intersect",
+    ops.IntervalFromInteger: "as_interval",
     ops.IsNull: "isnull",
     ops.LStrip: "lstrip",
     ops.Lowercase: "lower",
     ops.MinRank: "rank",
     ops.NthValue: "nth",
+    ops.NullIf: "nullif",
     ops.RStrip: "rstrip",
     ops.RegexSearch: "re_search",
     ops.StandardDev: "std",
@@ -171,7 +173,9 @@ def string_concat(op, arg):
 
 @translate.register(ops.Not)
 def not_(op, arg):
-    return f"~{_maybe_add_parens(op.arg, arg)}"
+    # parenthesized like a binary operator: ``~x.name('y')`` would apply the
+    # method first
+    return f"(~{_maybe_add_parens(op.arg, arg)})"
 
 
 @translate.register(ops.IdenticalTo)
@@ -199,16 +203,23 @@ def temporal_delta(op, left, right, part):
 
 @translate.register(ops.Negate)
 def negate(op, arg):
-    return f"-{_maybe_add_parens(op.arg, arg)}"
+    return f"(-{_maybe_add_parens(op.arg, arg)})"
 
 
 @translate.register(ops.ExistsSubquery)
-def exists_subquery(op, rel, rendered):
-    # ``(pred).any()`` is the documented way to spell a correlated EXISTS;
-    # it needs the predicate to span exactly the inner and the outer table
-    if isinstance(op.rel, ops.Filter):
+def exists_subquery(op, rel, rendered, outer):
+    # ``(pred).any()`` is the documented way to spell a correlated EXISTS. It
+    # takes the outer table from the relation it is evaluated against, so it
+    # rebuilds only when the predicates span exactly the inner relation and
+    # that outer one, and hold no subquery of their own
+    if isinstance(op.rel, ops.Filter) and outer is not None:
         preds = op.rel.predicates
-        if len(set().union(*(pred.relations for pred in preds))) == 2:
+        relations = set().union(*(pred.relations for pred in preds))
+        if (
+            len(relations) == 2
+            and relations == {op.rel.parent, outer}
+            and not any(pred.find(ops.Subquery, filter=ops.Value) for pred in preds)
+        ):
             pieces = [_maybe_add_parens(pred, rendered[pred]) for pred in preds]
             return f"({' & '.join(pieces)}).any()"
     return f"({rel}.count() > 0)"
@@ -387,13 +398,20 @@ def join(op, first, rest, values):
     return result
 
 
+# the default of ``distinct`` differs between the set operation methods
+_set_operation_defaults = {
+    ops.Union: False,
+    ops.Intersection: True,
+    ops.Difference: True,
+}
+
+
 @translate.register(ops.Set)
 def union(op, left, right, distinct):
     method = _get_method_name(op)
-    if distinct:
-        return f"{left}.{method}({right}, distinct=True)"
-    else:
-        return f"{left}.{method}({right})"
+    if op.distinct != _set_operation_defaults[type(op)]:
+        return f"{left}.{method}({right}, distinct={op.distinct})"
+    return f"{left}.{method}({right})"
 
 
 @translate.register(ops.Limit)
@@ -584,6 +602,8 @@ class CodeContext:
         self.assign_result_to = assign_result_to
         self._shorthand_counters = collections.defaultdict(itertools.count)
         self.rendered = {}
+        # the relation each EXISTS is evaluated against, by subquery node
+        self.exists_outer = {}
 
     def variable_for(self, node):
         klass = type(node)
@@ -667,10 +687,23 @@ def decompile(
     for n in graph:
         if isinstance(n, ops.JoinReference):
             joined[n.parent] += len(dependents[n])
+        # ``(pred).any()`` resolves the outer table of an EXISTS from the
+        # relation whose predicates or values hold it
+        if isinstance(n, ops.Filter):
+            values = n.predicates
+        elif isinstance(n, ops.Project):
+            values = n.values.values()
+        else:
+            continue
+        for value in values:
+            for sub in value.find(ops.ExistsSubquery, filter=ops.Value):
+                ctx.exists_outer[sub] = n.parent
 
     def fn(node, _, *args, **kwargs):
         if isinstance(node, ctx.needs_rendered):
             kwargs["rendered"] = ctx.rendered
+        if isinstance(node, ops.ExistsSubquery):
+            kwargs["outer"] = ctx.exists_outer.get(node)
         code = translate(node, *args, **kwargs)
         n_dependents = len(dependents[node]) + joined[node]
 

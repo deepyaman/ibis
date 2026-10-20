@@ -50,7 +50,18 @@ roundtrip_cases = {
     "interval_literal": ibis.interval(1, "D"),
     "exists": t.filter((u.a == t.a).any()),
     "not_exists": t.filter(~((u.a == t.a) & (u.c > 1)).any()),
+    "exists_on_filtered": asian_countries.filter(
+        (u.a == asian_countries.population).any()
+    ),
     "in_subquery": t.filter(t.a.isin(u.a)),
+    "aliased_unary": t.select(
+        (~(t.a > 1)).name("x"), (-t.a).name("neg"), t.a.negate().negate().name("k")
+    ),
+    "nullif": t.select(t.b.nullif("x").name("n")),
+    "as_interval": t.select(t.a.as_interval("D").name("i")),
+    "difference_all": t.select(t.a).difference(u.select(u.a), distinct=False),
+    "intersect_all": t.select(t.a).intersect(u.select(u.a), distinct=False),
+    "union_distinct": t.select(t.a).union(u.select(u.a), distinct=True),
     "correlated_scalar_subquery": t.filter(
         t.a > u.filter(u.a == t.a).aggregate(m=u.a.mean()).as_scalar()
     ),
