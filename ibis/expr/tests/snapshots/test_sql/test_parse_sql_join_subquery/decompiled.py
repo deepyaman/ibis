@@ -13,7 +13,7 @@ call = ibis.table(
 selfreference = call.view()
 agg = selfreference.aggregate([selfreference.call_attempts.mean().name("mean")])
 
-result = call.inner_join(agg, (call.call_attempts > agg.mean)).select(
+result = call.inner_join(agg, (agg.mean < call.call_attempts)).select(
     call.start_time,
     call.end_time,
     call.employee_id,

@@ -8,6 +8,7 @@ import pytest
 from pytest import param
 
 import ibis
+import ibis.common.exceptions as com
 from ibis.backends.duckdb.tests.test_parse_sql import assert_same_rows, roundtrip
 from ibis.backends.tests.tpc.conftest import compare_tpc_results
 from ibis.formats.pandas import PandasData
@@ -93,7 +94,7 @@ root = Path(__file__).absolute().parents[3]
 SQL_QUERY_PATH = root / "backends" / "tests" / "tpc" / "queries" / "duckdb" / "h"
 TPCDS_QUERY_PATH = root / "backends" / "tests" / "tpc" / "queries" / "duckdb" / "ds"
 
-# Ibis has no ROLLUP / GROUPING SETS
+# Ibis has no ROLLUP / GROUPING SETS; parse_sql rejects them up front
 TPCDS_ROLLUP_QUERIES = frozenset({5, 14, 18, 22, 67, 70, 77, 80, 86})
 
 
@@ -117,7 +118,7 @@ def test_parse_sql_tpch(tpch_query, snapshot, con):
     with open(tpch_query_file) as f:
         sql = f.read()
 
-    expr = ibis.parse_sql(sql, tpch_catalog)
+    expr = ibis.parse_sql(sql, tpch_catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "out_tpch.py")
 
@@ -170,7 +171,13 @@ def test_parse_sql_tpch_results(tpch_query, decompile, con):
         param(
             q,
             id=f"tpcds{q:02d}",
-            marks=[pytest.mark.xfail(reason="requires rollup")]
+            marks=[
+                pytest.mark.xfail(
+                    raises=com.UnsupportedOperationError,
+                    reason="GROUP BY ROLLUP is not supported",
+                    strict=True,
+                )
+            ]
             if q in TPCDS_ROLLUP_QUERIES
             else [],
         )

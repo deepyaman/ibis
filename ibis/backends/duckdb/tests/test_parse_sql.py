@@ -5,10 +5,9 @@ from __future__ import annotations
 import duckdb
 import pandas as pd
 import pytest
-import sqlglot
-from packaging.version import parse as vparse
 
 import ibis
+import ibis.common.exceptions as com
 
 pytest.importorskip("duckdb")
 
@@ -88,20 +87,13 @@ def assert_same_rows(result: pd.DataFrame, expected: pd.DataFrame) -> None:
     pd.testing.assert_frame_equal(left, right, check_exact=False, atol=0.011)
 
 
-OFFSET_XFAIL = pytest.mark.xfail(
-    vparse(sqlglot.__version__) < vparse("30"),
-    reason="the sqlglot planner drops OFFSET before 30",
-)
-
 CASES = {
     "select_where": "SELECT a, b FROM t WHERE a > 1",
     "count_star": "SELECT COUNT(*) AS n FROM t",
     "count_star_group_by": "SELECT b, COUNT(*) AS n FROM t GROUP BY b",
     "distinct": "SELECT DISTINCT a FROM t",
     "having": "SELECT a, SUM(c) AS s FROM t GROUP BY a HAVING SUM(c) > 2",
-    "order_limit_offset": pytest.param(
-        "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1", marks=OFFSET_XFAIL
-    ),
+    "order_limit_offset": "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1",
     "case_when": "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END AS sz FROM t",
     "not_is_null": "SELECT a FROM t WHERE NOT (b IS NULL)",
     "is_null": "SELECT a FROM t WHERE b IS NULL",
@@ -150,6 +142,82 @@ CASES = {
     "aggregate_of_expression": "SELECT SUM(c * 2) AS s FROM t",
     "math_functions": "SELECT ROUND(c, 1) AS r, ABS(a - 2) AS ab, GREATEST(a, 2) AS g FROM t",
     "concat": "SELECT b || '_' || b AS bb, CONCAT(b, 'x') AS bx FROM t",
+    "derived_computed": "SELECT s.z FROM (SELECT a + c AS z FROM t) AS s",
+    "derived_where_alias": "SELECT s.aa FROM (SELECT a AS aa FROM t) AS s WHERE s.aa > 1",
+    "nested_derived": "SELECT q.z FROM (SELECT s.z + 1 AS z FROM (SELECT a AS z FROM t) AS s) AS q",
+    "derived_with_limit": "SELECT s.a FROM (SELECT a FROM t ORDER BY a LIMIT 2) AS s",
+    "scalar_sub_select": "SELECT a, (SELECT MAX(a) FROM u) AS m FROM t",
+    "corr_scalar_select": "SELECT a, (SELECT MAX(u.a) FROM u WHERE u.a = t.a) AS m FROM t",
+    "corr_scalar_select_after_where": "SELECT a, (SELECT COUNT(*) FROM u WHERE u.a = t.a) AS n FROM t WHERE c > 1",
+    "count_star_arith": "SELECT SUM(c) / COUNT(*) AS r FROM t",
+    "order_by_nonprojected": "SELECT a FROM t ORDER BY c DESC",
+    "order_by_alias": "SELECT a + 1 AS x FROM t ORDER BY x",
+    "order_by_ordinal": "SELECT a, b FROM t ORDER BY 2, 1",
+    "order_by_agg_not_selected": "SELECT a FROM t GROUP BY a ORDER BY SUM(c)",
+    "having_alias": "SELECT a, SUM(c) AS s FROM t GROUP BY a HAVING s > 2",
+    "having_count_not_selected": "SELECT b FROM t GROUP BY b HAVING COUNT(*) > 1",
+    "having_corr_sub": "SELECT a, SUM(c) AS s FROM t GROUP BY a HAVING SUM(c) > (SELECT AVG(u.a) FROM u WHERE u.a = t.a)",
+    "select_corr_after_group": "SELECT a, (SELECT COUNT(*) FROM u WHERE u.a = t.a) AS n FROM t GROUP BY a",
+    "group_by_expression_alias": "SELECT a % 2 AS parity, COUNT(*) AS n FROM t GROUP BY parity",
+    "group_by_ordinal": "SELECT a % 2, COUNT(*) FROM t GROUP BY 1",
+    "dup_names": "SELECT a, a FROM t",
+    "dup_alias_select": "SELECT a, COUNT(*) AS a FROM t GROUP BY a",
+    "eq_null": "SELECT a FROM t WHERE b = NULL",
+    "null_arith": "SELECT a + NULL AS z FROM t",
+    "try_cast": "SELECT TRY_CAST(b AS INTEGER) AS i FROM t",
+    "using": "SELECT a, x FROM t JOIN u USING (a)",
+    "semi": "SELECT a FROM t SEMI JOIN u ON t.a = u.a",
+    "anti": "SELECT a FROM t ANTI JOIN u ON t.a = u.a",
+    "right_join": "SELECT t.a, u.x FROM t RIGHT JOIN u ON t.a = u.a",
+    "full_join": "SELECT t.a, u.x FROM t FULL OUTER JOIN u ON t.a = u.a",
+    "select_star_join": "SELECT * FROM t JOIN u ON t.a = u.a",
+    "window_filter_derived": "SELECT * FROM (SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t) AS s WHERE rn = 1",
+    "window_order_by_dropped": "SELECT a, SUM(c) OVER (PARTITION BY b) AS s FROM t ORDER BY b",
+    "subq_in_join_source": "SELECT t.a, s.m FROM t JOIN (SELECT a, MAX(c) AS m FROM t GROUP BY a) AS s ON t.a = s.a WHERE s.m > 1",
+    "join_on_subquery_eq": "SELECT t.a FROM t JOIN u ON t.a = u.a AND t.c > (SELECT AVG(c) FROM t)",
+    "three_way_comma": "SELECT t.a, t2.b FROM t, u, t AS t2 WHERE t.a = u.a AND u.a = t2.a AND t2.c > 1",
+    "comma_join_where_or": "SELECT t.a FROM t, u WHERE (t.a = u.a AND t.c > 1) OR (t.a = u.a + 1 AND t.c < 1)",
+    "left_join_filter_right": "SELECT t.a FROM t LEFT JOIN u ON t.a = u.a WHERE u.x = 'p'",
+    "named_window": "SELECT a, SUM(c) OVER w AS s FROM t WINDOW w AS (PARTITION BY b ORDER BY a)",
+    "count_star_window_group": "SELECT a, COUNT(*) OVER () AS n FROM t GROUP BY a",
+    "filter_where_agg": "SELECT SUM(c) FILTER (WHERE a > 1) AS s FROM t",
+    "any_subquery": "SELECT a FROM t WHERE a = ANY (SELECT a FROM u)",
+    "distinct_order_by": "SELECT DISTINCT a FROM t ORDER BY a",
+    "cte_corr_scalar": "WITH x AS (SELECT a, c FROM t WHERE a > 1) SELECT a FROM x WHERE c > (SELECT AVG(u.a) FROM u WHERE u.a = x.a)",
+    "exists_join_inner": "SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM u JOIN t AS t2 ON u.a = t2.a WHERE t2.c = t.c)",
+}
+
+UNSUPPORTED = {
+    "distinct_on": ("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b", "DISTINCT ON"),
+    "qualify": (
+        "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t QUALIFY rn = 1",
+        "QUALIFY",
+    ),
+    "rollup": ("SELECT a, COUNT(*) FROM t GROUP BY ROLLUP (a)", "ROLLUP"),
+    "cube": ("SELECT a, b, COUNT(*) FROM t GROUP BY CUBE (a, b)", "CUBE"),
+    "grouping_sets": (
+        "SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))",
+        "GROUPING SETS",
+    ),
+    "natural_join": ("SELECT * FROM t NATURAL JOIN u", "(?i)join"),
+    "lateral": (
+        "SELECT t.a, l.z FROM t, LATERAL (SELECT t.a + 1 AS z) AS l",
+        "(?i)lateral",
+    ),
+    "values": ("SELECT * FROM (VALUES (1, 'a')) AS v(n, s)", "(?i)values"),
+    "unnest": ("SELECT * FROM UNNEST([1, 2]) AS x(v)", "(?i)unnest"),
+    "recursive_cte": (
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        "RECURSIVE",
+    ),
+    "sum_distinct": ("SELECT SUM(DISTINCT a) FROM t", "(?i)distinct"),
+    "limit_subquery": ("SELECT a FROM t LIMIT (SELECT 1)", "LIMIT"),
+    "outer_join_subquery_on": (
+        "SELECT t.a FROM t LEFT JOIN u ON t.a = u.a AND t.c > (SELECT AVG(c) FROM t)",
+        "outer join",
+    ),
+    "unknown_function": ("SELECT MD5(b) FROM t", "MD5"),
+    "any_lt": ("SELECT a FROM t WHERE a < ANY (SELECT a FROM u)", "ANY"),
 }
 
 
@@ -180,3 +248,12 @@ def test_decompile_roundtrip_matches_duckdb(duck, sql):
     result = ibis.duckdb.from_connection(duck).to_pandas(expr)
 
     assert_same_rows(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"), list(UNSUPPORTED.values()), ids=list(UNSUPPORTED)
+)
+def test_parse_sql_unsupported(sql, message):
+    """SQL `parse_sql` cannot translate raises instead of dropping a clause."""
+    with pytest.raises(com.UnsupportedOperationError, match=message):
+        ibis.parse_sql(sql, CATALOG, dialect="duckdb")

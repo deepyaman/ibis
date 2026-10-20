@@ -3,13 +3,16 @@ from __future__ import annotations
 import collections
 import contextlib
 import operator
+from dataclasses import dataclass, field
 from functools import singledispatch
 
 import sqlglot as sg
 import sqlglot.expressions as sge
 import sqlglot.optimizer as sgo
-import sqlglot.planner as sgp
 from public import public
+from sqlglot.optimizer.annotate_types import annotate_types
+from sqlglot.optimizer.canonicalize import canonicalize
+from sqlglot.optimizer.qualify import qualify
 
 import ibis
 import ibis.common.exceptions as com
@@ -20,27 +23,29 @@ import ibis.expr.types as ir
 from ibis.backends.sql.datatypes import SqlglotType
 from ibis.util import experimental
 
-# The sqlglot optimizer rules we run before planning.
-#
-# ``unnest_subqueries``, ``merge_subqueries`` and ``eliminate_subqueries``
-# rewrite correlated subqueries into joins against generated derived tables
-# (``_u_0``, ``partsupp_2``, ...). Ibis can express correlated subqueries
-# directly (``EXISTS`` -> ``ExistsSubquery``, scalar subqueries ->
-# ``ScalarSubquery``), so keeping them intact yields a much more direct
-# translation. ``optimize_joins`` fails with a cycle error when a correlated
-# subquery remains in a join condition, so it is dropped as well.
-_DROPPED_RULES = frozenset(
-    {
-        "unnest_subqueries",
-        "merge_subqueries",
-        "eliminate_subqueries",
-        "optimize_joins",
-    }
-)
-RULES = tuple(rule for rule in sgo.RULES if rule.__name__ not in _DROPPED_RULES)
+# The optimizer rules run before conversion. ``qualify`` resolves every column
+# to the source it comes from, expands ``*`` and references to SELECT-list
+# aliases, and names every output column; ``annotate_types`` and
+# ``canonicalize`` make the casts SQL implies explicit (a date column compared
+# to a string literal). The rewriting rules (predicate pushdown, subquery
+# merging, normalization) are left out: the expression follows the query as
+# written.
+RULES = (qualify, annotate_types, canonicalize)
+
+# sqlglot renamed these arguments in 28.0 and made ``SetOperation`` the base of
+# ``Union``, ``Intersect`` and ``Except`` in 26.0
+_SET_OPERATION = getattr(sge, "SetOperation", sge.Union)
 
 
-class Catalog(dict[str, sch.Schema]):
+def _arg(node, *names):
+    """The first of ``names`` set on ``node``."""
+    for name in names:
+        if (value := node.args.get(name)) is not None:
+            return value
+    return None
+
+
+class Catalog(dict[str, ir.Table]):
     """A catalog of tables and their schemas."""
 
     typemap = {
@@ -65,38 +70,6 @@ class Catalog(dict[str, sch.Schema]):
         dt.Struct: "struct",
     }
 
-    def __init__(
-        self,
-        *args,
-        bases: dict[str, ir.Table] | None = None,
-        seen: set[str] | None = None,
-        aliases: dict[str, ir.Table] | None = None,
-        outer: tuple[ir.Table, ...] = (),
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        # The base tables of the query, by name. They are kept apart from the
-        # bindings (``self``) so that a base table's name does not shadow the
-        # scan of it a step is actually working with.
-        self.bases: dict[str, ir.Table] = {} if bases is None else bases
-        # Every scanned alias in the query, shared by reference. Later steps
-        # (a sort over a join, say) refer to columns by the alias they were
-        # scanned under, which is not a step name. The same alias may be
-        # scanned in several scopes (``store`` in two CTEs); column resolution
-        # picks the candidate that belongs to the relation being built.
-        self.aliases: dict[str, list[ir.Table]] = {} if aliases is None else aliases
-        # Base table names that have already been scanned somewhere in the
-        # query. Shared (by reference) by every overlay of this catalog so a
-        # second scan of the same base table (a self join, or a correlated
-        # subquery over the outer table) becomes a distinct ``.view()``.
-        self.seen: set[str] = set() if seen is None else seen
-        # The stack of relations that conditions and projections currently
-        # apply to, innermost last. Column references are dereferenced to
-        # their fields so that outer references inside correlated subqueries
-        # point at the enclosing join chain rather than at one of its (not
-        # directly addressable) members.
-        self.outer: tuple[ir.Table, ...] = outer
-
     def to_sqlglot_dtype(self, dtype: dt.DataType) -> str:
         if dtype.is_geospatial():
             return dtype.geotype
@@ -109,203 +82,134 @@ class Catalog(dict[str, sch.Schema]):
 
     def to_sqlglot(self):
         return {
-            name: self.to_sqlglot_schema(table.schema())
-            for name, table in self.bases.items()
+            name: self.to_sqlglot_schema(table.schema()) for name, table in self.items()
         }
 
-    def bind(self, **tables) -> Catalog:
-        """Return a new catalog with additional name -> table bindings."""
-        return Catalog(
-            {**self, **tables},
-            bases=self.bases,
-            seen=self.seen,
-            aliases=self.aliases,
-            outer=self.outer,
-        )
 
-    def with_outer(self, outer: ir.Table) -> Catalog:
-        """Return a new catalog whose column references resolve against ``outer``."""
-        return Catalog(
-            self,
-            bases=self.bases,
-            seen=self.seen,
-            aliases=self.aliases,
-            outer=(*self.outer, outer),
-        )
+@dataclass
+class _Root:
+    """State shared by every scope of a query."""
 
-    def register(self, alias: str, table: ir.Table) -> None:
-        tables = self.aliases.setdefault(alias, [])
-        if not any(known.op() == table.op() for known in tables):
-            tables.append(table)
+    catalog: Catalog
+    dialect: str | None
+    # relations scanned so far; scanning one again yields a distinct ``.view()``
+    seen: set[ops.Relation] = field(default_factory=set)
 
-    def candidates(self, alias: str) -> list[ir.Table]:
-        """The relations ``alias`` may refer to, most specific first."""
-        tables = []
-        if alias in self:
-            tables.append(self[alias])
-        tables.extend(self.aliases.get(alias, ()))
-        if not tables and self.outer:
-            # the planner inlines nested derived tables into one step, which
-            # drops their intermediate aliases; those columns live on the
-            # relation the step is working on
-            tables.append(self.outer[-1])
-        if not tables:
-            raise KeyError(alias)
-        return tables
+
+@dataclass
+class _Member:
+    """A FROM or JOIN alias: the relation to index and its column names there."""
+
+    table: ir.Table
+    columns: dict[str, str]
+
+
+@dataclass
+class _Aggregation:
+    """Where the expressions of an aggregated SELECT ended up."""
+
+    # an aggregate call or GROUP BY expression -> column of the aggregate
+    memo: dict[sge.Expression, str]
+    # (alias, column) of a plain GROUP BY column -> column of the aggregate
+    groups: dict[tuple[str, str], str]
+
+
+class Scope:
+    """Name resolution for one SELECT.
+
+    Column references resolve against the relation the SELECT is building
+    (``rel``), which each clause replaces as it is applied: the FROM clause's
+    table or join chain, then the filtered relation, then the aggregate. A
+    reference to an alias of an enclosing SELECT (a correlated subquery)
+    resolves through ``parent`` to a field of that SELECT's current relation.
+    """
+
+    def __init__(self, root: _Root, parent: Scope | None = None):
+        self.root = root
+        self.parent = parent
+        self.ctes: dict[str, ir.Table] = {}
+        self.members: dict[str, _Member] = {}
+        self.windows: dict[str, sge.Window] = {}
+        self.rel: ir.Table | None = None
+        self.agg: _Aggregation | None = None
+        # the SELECT list by output name, for ORDER BY
+        self.outputs: dict[str, ir.Value] | None = None
+
+    def child(self) -> Scope:
+        return Scope(self.root, parent=self)
+
+    def cte(self, name: str) -> ir.Table | None:
+        scope = self
+        while scope is not None:
+            if (table := scope.ctes.get(name)) is not None:
+                return table
+            scope = scope.parent
+        return None
+
+    def bind(self, alias: str, table: ir.Table) -> None:
+        self.members[alias] = _Member(table, dict(zip(table.columns, table.columns)))
+
+    def rebind(self, rel: ir.Table) -> None:
+        """Continue building from ``rel``, which keeps the column names."""
+        self.rel = rel
+        for member in self.members.values():
+            member.table = rel
 
     def column(self, alias: str, name: str) -> ir.Value:
-        """Resolve ``alias.name``, preferring the relation currently being built."""
         if not alias:
-            return self.dereference(self.outer[-1][name])
-        if alias in self:
-            # a binding made by the step being converted (or an enclosing one)
-            # is authoritative; the registry is for aliases a step never saw
-            if name in (table := self[alias]).columns:
-                return self.dereference(table[name])
-            if self.outer and name in self.outer[-1].columns:
-                # a SELECT-list alias referenced through the step's name
-                return self.outer[-1][name]
-            raise com.IbisTypeError(f"Column {name!r} is not found in {alias!r}")
-        fallback = None
-        for table in self.candidates(alias):
-            if name not in table.columns:
-                continue
-            field = table[name]
-            if (resolved := self.dereference(field)) is not field:
-                return resolved
-            if fallback is None:
-                fallback = field
-        if fallback is None:
-            raise com.IbisTypeError(
-                f"Column {name!r} is not found in any relation named {alias!r}"
-            )
-        return fallback
-
-    def dereference(self, field: ir.Value) -> ir.Value:
-        """Resolve ``field`` to the equivalent field of the relation being built.
-
-        A field of a join chain's member relation becomes the chain's field;
-        a field of a relation the current one is built on (the chain under an
-        aggregate, say) becomes the current relation's field, following any
-        renames the relations in between apply.
-        """
-        if not isinstance(op := field.op(), ops.Field):
-            return field
-        for outer in reversed(self.outer):
-            # the relations ``outer`` is built on, down to a join chain if any
-            lineage = []
-            node = outer.op()
-            while node is not None and not isinstance(node, ops.JoinChain):
-                lineage.append(node)
-                node = getattr(node, "parent", None)
-            if node is not None:
-                lineage.append(node)
-            if op.rel in lineage:
-                index, name = lineage.index(op.rel), op.name
-            elif node is not None and (name := _chain_column(node, op.rel, op.name)):
-                index = len(lineage) - 1
-            else:
-                continue
-            name = _trace_name(lineage[:index], lineage[index], name)
-            if name is not None and name in outer.columns:
-                return outer[name]
-        return field
-
-    def overlay(self, step):
-        # dependencies are kept in a set; convert them in the order the query
-        # names them so that which scan of a table becomes the ``.view()`` is
-        # stable from run to run
-        order = []
-        if isinstance(step, sgp.Join):
-            order = [step.source_name or step.name, *step.joins]
-        deps = sorted(
-            step.dependencies,
-            key=lambda dep: (
-                order.index(dep.name) if dep.name in order else len(order),
-                dep.name or "",
-            ),
-        )
-        updates = {dep.name: convert(dep, catalog=self) for dep in deps}
-        for name, table in updates.items():
-            self.register(name, table)
-        return self.bind(**updates)
+            if self.outputs is not None and name in self.outputs:
+                return self.outputs[name]
+            raise com.IbisInputError(f"Cannot resolve column {name!r}")
+        if (member := self.members.get(alias)) is not None:
+            if self.agg is not None:
+                if (column := self.agg.groups.get((alias, name))) is None:
+                    raise com.IbisInputError(
+                        f"Column {alias}.{name} must appear in the GROUP BY clause "
+                        "or be used in an aggregate function"
+                    )
+                return self.rel[column]
+            if (column := member.columns.get(name)) is None:
+                raise com.IbisInputError(f"Column {name!r} is not found in {alias!r}")
+            return member.table[column]
+        if self.parent is not None:
+            return self.parent.column(alias, name)
+        raise com.IbisInputError(f"Unknown table or alias {alias!r}")
 
 
-def _is_member_field(value, rel, name) -> bool:
-    """Whether ``value`` is the field ``name`` of the join member ``rel``."""
-    return (
-        isinstance(value, ops.Field)
-        and value.name == name
-        and (
-            value.rel == rel
-            or (isinstance(value.rel, ops.JoinReference) and value.rel.parent == rel)
-        )
+def _unsupported(node, scope, what=None):
+    dialect = scope.root.dialect if scope is not None else None
+    sql = node.sql(dialect=dialect) if isinstance(node, sge.Expression) else str(node)
+    return com.UnsupportedOperationError(
+        f"{what or type(node).__name__} is not supported: {sql}"
     )
 
 
-def _chain_column(chain, rel, name) -> str | None:
-    """The output column of ``chain`` holding field ``name`` of member ``rel``.
-
-    A column of the right table that an inner equality predicate makes equal
-    to a column of the left is dropped from the chain, so it is looked up
-    through the other side of that predicate.
-    """
-    for out, value in chain.values.items():
-        if _is_member_field(value, rel, name):
-            return out
-    for link in chain.rest:
-        for pred in link.predicates:
-            if not (
-                isinstance(pred, ops.Equals)
-                and isinstance(pred.left, ops.Field)
-                and isinstance(pred.right, ops.Field)
-            ):
-                continue
-            for this, other in ((pred.left, pred.right), (pred.right, pred.left)):
-                if _is_member_field(this, rel, name):
-                    for out, value in chain.values.items():
-                        if value == other:
-                            return out
-    return None
+def _unparen(node):
+    while isinstance(node, sge.Paren):
+        node = node.this
+    return node
 
 
-def _trace_name(above, rel, name) -> str | None:
-    """Follow column ``name`` of ``rel`` up through the relations ``above`` it.
-
-    ``above`` lists the relations from the outermost down to the child of
-    ``rel``; each may pass the column through or rename it.
-    """
-    for node in reversed(above):
-        field = ops.Field(rel, name)
-        if isinstance(node, ops.Project):
-            name = next((k for k, v in node.values.items() if v == field), None)
-        elif isinstance(node, ops.Aggregate):
-            name = next(
-                (
-                    k
-                    for k, v in (*node.groups.items(), *node.metrics.items())
-                    if v == field
-                ),
-                None,
-            )
-        elif name not in node.schema:
-            name = None
-        if name is None:
-            return None
-        rel = node
-    return name
+def _conjuncts(node):
+    """The AND-ed conditions of a WHERE, HAVING or ON clause."""
+    if node is None:
+        return []
+    if isinstance(node, (sge.Where, sge.Having)):
+        node = node.this
+    node = _unparen(node)
+    if isinstance(node, sge.And):
+        return _conjuncts(node.left) + _conjuncts(node.right)
+    return [node]
 
 
-def apply_limit(table, step):
-    """Applies a LIMIT, if applicable."""
+def _tables(node) -> set[str]:
+    return {column.table for column in node.find_all(sge.Column)}
 
-    offset = getattr(step, "offset", None)
-    if not isinstance(step.limit, int):
-        if isinstance(offset, int):
-            return table.limit(None, offset=offset)
-        return table
 
-    return table.limit(step.limit, offset=offset if isinstance(offset, int) else 0)
+def _int(node, scope) -> int:
+    if isinstance(node, sge.Literal) and node.is_int:
+        return int(node.this)
+    raise _unsupported(node, scope, "A LIMIT or OFFSET that is not an integer")
 
 
 def _unique_names(values):
@@ -321,404 +225,460 @@ def _unique_names(values):
     return out
 
 
-def apply_projections(table, step, catalog):
-    """Applies a SELECT projection, if applicable."""
+def _scan(table, scope):
+    """Bind a scan of ``table``; a relation scanned twice gets a distinct view."""
+    op = table.op()
+    if op in scope.root.seen:
+        return table.view()
+    scope.root.seen.add(op)
+    return table
 
-    if not step.projections:
-        return table
 
-    projs = [convert(proj, catalog=catalog) for proj in step.projections]
-    return table.select(_unique_names(projs))
-
-
-def apply_condition(table, condition, catalog):
-    """Applies a WHERE/HAVING condition, if applicable."""
-    if condition is None:
-        return table
-    pred = convert(condition, catalog=catalog)
-    if isinstance(pred, ir.BooleanScalar) and pred.op() == ops.Literal(
-        True, dt.boolean
+def _bind_source(node, scope):
+    """Convert a FROM or JOIN source and bind its alias; returns (alias, table)."""
+    for arg, what in (
+        ("pivots", "PIVOT"),
+        ("joins", "A nested join"),
+        ("sample", "TABLESAMPLE"),
     ):
-        return table
-    return table.filter(pred)
-
-
-@singledispatch
-def convert(step, catalog):
-    raise TypeError(type(step))
-
-
-@convert.register(sgp.Scan)
-def convert_scan(scan, catalog):
-    source = scan.source
-
-    if source is None:
-        # ``SELECT 1 AS x`` has no FROM clause
-        values = {}
-        for proj in scan.projections:
-            value = convert(proj, catalog=catalog)
-            op = value.op()
-            values[value.get_name()] = op.arg if isinstance(op, ops.Alias) else op
-        return apply_limit(ops.DummyTable(values).to_expr(), scan)
-
-    alias = source.alias_or_name
-
-    if isinstance(source, sge.Subquery):
-        # a derived table: ``FROM (SELECT ...) AS s``
-        table = convert(source.this, catalog=catalog)
+        if node.args.get(arg):
+            raise _unsupported(node, scope, what)
+    if isinstance(node, sge.Table):
+        name = node.name
+        if (table := scope.cte(name)) is None:
+            if (table := scope.root.catalog.get(name)) is None:
+                raise com.IbisInputError(f"Table {name!r} is not in the catalog")
+    elif isinstance(node, sge.Subquery):
+        table = convert_relation(node.this, scope.child())
     else:
-        name = source.name
-        # a CTE (bound) or a base table
-        table = catalog[name] if name in catalog else catalog.bases[name]
-        if name in catalog.seen:
-            table = table.view()
-        catalog.seen.add(name)
-
-    # make the alias visible to correlated subqueries in the condition
-    catalog = catalog.bind(**{alias: table})
-
-    table = apply_condition(table, scan.condition, catalog)
-    catalog = catalog.bind(**{scan.name: table})
-    table = apply_projections(table, scan, catalog)
-    catalog.register(alias, table)
-    catalog.register(scan.name, table)
-    table = apply_limit(table, scan)
-
-    return table
+        raise _unsupported(node, scope)
+    table = _scan(table, scope)
+    alias = node.alias_or_name
+    scope.bind(alias, table)
+    return alias, table
 
 
-def qualify_projections(projections, groups):
-    # The sqlglot planner will (sometimes) alias projections to the aggregate
-    # that precedes it.
-    #
-    # - Sort: lineitem (132849388268768)
-    #   Context:
-    #     Key:
-    #       - "l_returnflag"
-    #       - "l_linestatus"
-    #   Projections:
-    #     - lineitem._g0 AS "l_returnflag"
-    #     - lineitem._g1 AS "l_linestatus"
-    #     <snip>
-    #   Dependencies:
-    #   - Aggregate: lineitem (132849388268864)
-    #     Context:
-    #       Aggregations:
-    #         <snip>
-    #       Group:
-    #         - "lineitem"."l_returnflag"  <-- this is _g0
-    #         - "lineitem"."l_linestatus"  <-- this is _g1
-    #         <snip>
-    #
-    #  These aliases are stored in a dictionary in the aggregate `groups`, so if
-    #  those are pulled out beforehand then we can use them to replace the
-    #  aliases in the projections.
-
-    def transformer(node):
-        if (
-            isinstance(node, sge.Column)
-            and (name := node.name).startswith("_g")
-            and isinstance(group := groups.get(name), sge.Column)
-        ):
-            # plain column groups keep their own name in the aggregate output;
-            # computed groups are emitted under the ``_gN`` name instead
-            return group
-        return node
-
-    projects = [project.transform(transformer) for project in projections]
-
-    return projects
-
-
-@convert.register(sgp.Sort)
-def convert_sort(sort, catalog):
-    catalog = catalog.overlay(sort)
-
-    table = catalog[sort.name]
-    catalog = catalog.with_outer(table)
-
-    projected = None
-    if sort.projections:
-        groups = {}
-        # group definitions that may be used in projections are defined
-        # in the aggregate in dependencies...
-        for dep in sort.dependencies:
-            if (group := getattr(dep, "group", None)) is not None:
-                groups |= group
-        projs = _unique_names(
-            [
-                convert(proj, catalog=catalog)
-                for proj in qualify_projections(sort.projections, groups)
-            ]
-        )
-        projected = table.select(projs)
-
-    if sort.key:
-        names = [key.this.name for key in sort.key if isinstance(key.this, sge.Column)]
-        simple = (
-            projected is not None
-            and len(names) == len(sort.key)
-            and len(set(names)) == len(names)
-            and all(name in projected.columns for name in names)
-            and all(key.this.table in ("", sort.name) for key in sort.key)
-        )
-        if simple:
-            # ``ORDER BY`` refers to the SELECT list by name
-            keys = [convert(key, catalog=None) for key in sort.key]
-            table = projected.order_by(keys)
-        elif projected is not None:
-            # the keys may mix SELECT-list aliases, columns the SELECT list
-            # drops, and qualified columns of a join member
-            extended = table.mutate(projs)
-            keys = [
-                convert(key, catalog=catalog.with_outer(extended)) for key in sort.key
-            ]
-            table = extended.order_by(keys).select([proj.get_name() for proj in projs])
-        else:
-            keys = [convert(key, catalog=catalog.with_outer(table)) for key in sort.key]
-            table = table.order_by(keys)
-    elif projected is not None:
-        table = projected
-
-    table = apply_limit(table, sort)
-
-    return table
-
-
-_join_types = {
-    "": "inner",
-    "LEFT": "left",
-    "RIGHT": "right",
-    "FULL": "outer",
+_JOIN_SIDES = {"": "inner", "LEFT": "left", "RIGHT": "right", "FULL": "outer"}
+_JOIN_KINDS = {
+    "": None,
+    "INNER": None,
+    "OUTER": None,
+    "CROSS": None,
+    "SEMI": "semi",
+    "ANTI": "anti",
 }
 
 
-@convert.register(sgp.Join)
-def convert_join(join, catalog):
-    catalog = catalog.overlay(join)
-
-    left_name = join.source_name or join.name
-    left_table = catalog[left_name]
-    deferred = []
-    local = {left_name, join.name, *join.joins}
-
-    def is_correlated(expression) -> bool:
-        return any(
-            column.table and column.table not in local
-            for column in expression.find_all(sge.Column)
-        )
-
-    for right_name, desc in join.joins.items():
-        right_table = catalog[right_name]
-        join_kind = _join_types[desc["side"]]
-
-        predicate = None
-        if desc["join_key"]:
-            for left_key, right_key in zip(desc["source_key"], desc["join_key"]):
-                if (
-                    left_key.find(sge.Select) is not None
-                    or right_key.find(sge.Select) is not None
-                    or is_correlated(left_key)
-                    or is_correlated(right_key)
-                ):
-                    # ``x = (SELECT ...)`` or ``x = outer.y`` is an equality
-                    # the planner mistook for a join key; it is a filter
-                    deferred.append(sge.EQ(this=left_key, expression=right_key))
-                    continue
-                left_key = convert(left_key, catalog=catalog)
-                right_key = convert(right_key, catalog=catalog)
-                if predicate is None:
-                    predicate = left_key == right_key
-                else:
-                    predicate &= left_key == right_key
-
-        if (condition := desc.get("condition")) is not None:
-            if join_kind == "inner" and (
-                condition.find(sge.Select) is not None or is_correlated(condition)
-            ):
-                deferred.append(condition)
-            else:
-                condition = convert(condition, catalog=catalog.with_outer(left_table))
-                if not _is_true(condition):
-                    predicate = (
-                        condition if predicate is None else predicate & condition
-                    )
-
-        # a chain may join the same relation several times, so colliding
-        # column names are suffixed with the (unique) alias, not ``_right``
-        rname = f"{{name}}_{right_name}"
-        if predicate is None:
-            left_table = left_table.cross_join(right_table, rname=rname)
-        else:
-            left_table = left_table.join(
-                right_table, predicates=predicate, how=join_kind, rname=rname
-            )
-
-    catalog = catalog.with_outer(left_table)
-    for condition in deferred:
-        left_table = apply_condition(left_table, condition, catalog)
-    left_table = apply_condition(left_table, join.condition, catalog)
-    left_table = apply_projections(left_table, join, catalog)
-    left_table = apply_limit(left_table, join)
-
-    catalog[left_name] = left_table
-    catalog.register(join.name, left_table)
-
-    return left_table
-
-
-def _is_true(expr) -> bool:
-    return isinstance(expr, ir.BooleanScalar) and expr.op() == ops.Literal(
-        True, dt.boolean
+def _hoistable(condition, visible, alias) -> bool:
+    """Whether a WHERE condition is a join condition of the table ``alias``."""
+    tables = _tables(condition)
+    return (
+        len(tables) >= 2
+        and alias in tables
+        and tables <= visible
+        and condition.find(sge.Select) is None
     )
 
 
-def _is_window(expression) -> bool:
-    return expression.find(sge.Window) is not None
+def _map_member(member, right, rel) -> None:
+    """Address the columns of a joined table through the join chain's output."""
+    columns = {}
+    source = right.op()
+    for name, value in rel.op().values.items():
+        # a member is wrapped in a ``JoinReference`` unless it is a reference
+        # already (a ``.view()``)
+        if isinstance(value, ops.Field) and (
+            value.rel == source
+            or (isinstance(value.rel, ops.JoinReference) and value.rel.parent == source)
+        ):
+            columns[value.name] = name
+    for name in right.columns:
+        # an inner join key is not repeated in the output when it is equal to
+        # the same-named column of the left side: it is that column
+        columns.setdefault(name, name)
+    member.columns = columns
 
 
-def replace_operands(agg):
-    # The sqlglot planner will pull out computed operands into a separate
-    # section and alias them #
-    # e.g.
-    # Context:
-    #   Aggregations:
-    #     - SUM("_a_0") AS "sum_disc_price"
-    #   Operands:
-    #     - "lineitem"."l_extendedprice" * (1 - "lineitem"."l_discount") AS _a_0
-    #
-    # For the purposes of decompiling, we want these to be inline, so here we
-    # replace those new aliases with the parsed sqlglot expression
-    #
-    # Window functions are lifted into the aggregate step as well. Everything
-    # a window item aggregates has to be computed by the aggregate first, so
-    # aggregate functions outside a window and aggregate operands used inside
-    # one become named metrics, and the item itself is evaluated over the
-    # aggregated relation (``SUM(x) * 100 / SUM(SUM(x)) OVER (...)``).
-    operands = {operand.alias: operand.this for operand in agg.operands}
-
-    def inline(node):
-        if isinstance(node, sge.Column) and node.name in operands.keys():
-            return operands[node.name]
-        return node
-
-    def has_aggregate(expression) -> bool:
-        return expression.find(sge.AggFunc) is not None
-
-    aggs = []
-    extra = {}
-
-    def split(node):
-        if isinstance(node, sge.AggFunc) and node.find_ancestor(sge.Window) is None:
-            name = f"_w_{len(extra)}"
-            extra[name] = sge.alias_(node.transform(inline), name, quoted=True)
-            return sge.column(name, quoted=True)
-        if isinstance(node, sge.Column) and node.name in operands.keys():
-            operand = operands[node.name]
-            if has_aggregate(operand):
-                extra.setdefault(node.name, sge.alias_(operand, node.name, quoted=True))
-                return node
-            return operand
-        return node
-
-    for item in agg.aggregations:
-        if _is_window(item):
-            aggs.append(item.transform(split))
-        else:
-            aggs.append(item.transform(inline))
-    aggs.extend(extra.values())
-
-    agg.aggregations = aggs
-
-    return agg
-
-
-@convert.register(sgp.Aggregate)
-def convert_aggregate(agg, catalog):
-    catalog = catalog.overlay(agg)
-
-    agg = replace_operands(agg)
-
-    table = catalog[agg.source]
-    catalog = catalog.with_outer(table)
-    groups = [
-        convert(g, catalog=catalog)
-        if isinstance(g, sge.Column)
-        else convert(g, catalog=catalog).name(name)
-        for name, g in agg.group.items()
-    ]
-    windows = [a for a in agg.aggregations if _is_window(a)]
-    metrics = [
-        convert(a, catalog=catalog) for a in agg.aggregations if not _is_window(a)
-    ]
-
-    if metrics or groups:
-        table = table.aggregate(metrics, by=groups)
-
-    # the aggregated table is referenced by the step name (or by its source's
-    # name) in HAVING and in the projections
-    catalog = catalog.bind(**{agg.name: table, agg.source: table}).with_outer(table)
-
-    if windows:
-        table = table.mutate([convert(w, catalog=catalog) for w in windows])
-        catalog = catalog.bind(**{agg.name: table, agg.source: table}).with_outer(table)
-
-    table = apply_condition(table, agg.condition, catalog)
-
-    if agg.projections:
-        projs = [
-            convert(proj, catalog=catalog)
-            for proj in qualify_projections(agg.projections, agg.group)
-        ]
-        # ``_h`` is the planner's name for the HAVING predicate, it is not
-        # part of the user's SELECT list
-        projs = [p for p in projs if p.get_name() != "_h"]
-        table = table.select(projs)
-
-    table = apply_limit(table, agg)
-
-    return table
-
-
-@convert.register(sge.Select)
-@convert.register(sge.SetOperation)
-def convert_select(select, catalog):
-    """Convert a (possibly nested) SELECT or set operation against ``catalog``.
-
-    The expression was already qualified and optimized as part of the whole
-    query, so it is planned as is; re-optimizing it in isolation would lose
-    the outer scope that correlated columns refer to.
-    """
-    if (with_ := select.args.get("with_")) is not None:
-        # bind the CTEs by name, then plan the query without them so that
-        # references to a CTE are plain scans resolved through the catalog
-        for cte in with_.expressions:
-            catalog = catalog.bind(**{cte.alias: convert(cte.this, catalog=catalog)})
-        select = select.copy()
-        select.set("with_", None)
-
-    if isinstance(select, sge.SetOperation):
-        return convert_set_operation(select, catalog)
-
-    # the planner's SetOperation step does not preserve which side is which,
-    # so derived tables built from a set operation are converted here and
-    # replaced by a reference to the converted table
-    if any(
-        _is_inlined_source(source, select)
-        for source in select.find_all(sge.Subquery)
-        if isinstance(source.this, sge.SetOperation)
-    ):
-        select = select.copy()
-        for source in list(select.find_all(sge.Subquery)):
-            if isinstance(source.this, sge.SetOperation) and _is_inlined_source(
-                source, select
+def _build_from(select, scope):
+    """Bind the FROM clause; returns the relation and the conditions to filter by."""
+    where = _conjuncts(select.args.get("where"))
+    if (from_ := _arg(select, "from_", "from")) is None:
+        return None, where
+    joins = select.args.get("joins") or []
+    alias, rel = _bind_source(from_.this, scope)
+    scope.rel = rel
+    bound = {alias}
+    deferred = []
+    for i, join in enumerate(joins):
+        if (
+            join.method
+            or join.args.get("using")
+            or join.args.get("match_condition")
+            or join.side not in _JOIN_SIDES
+            or join.kind not in _JOIN_KINDS
+        ):
+            raise _unsupported(join, scope, "This kind of join")
+        how = _JOIN_KINDS[join.kind] or _JOIN_SIDES[join.side]
+        alias, right = _bind_source(join.this, scope)
+        visible = bound | {alias}
+        on = _conjuncts(join.args.get("on"))
+        if (
+            not on
+            and join.kind in ("", "CROSS")
+            and not join.side
+            and all(later.side not in ("RIGHT", "FULL") for later in joins[i + 1 :])
+        ):
+            # ``FROM a, b WHERE a.x = b.y``: the conditions relating the new
+            # table to the ones before it are its join conditions
+            on = [c for c in where if _hoistable(c, visible, alias)]
+            where = [c for c in where if not any(c is h for h in on)]
+        local, late = [], []
+        for condition in on:
+            if condition.find(sge.Select) is not None or not (
+                _tables(condition) <= visible
             ):
-                alias = source.alias_or_name
-                catalog = catalog.bind(**{alias: convert(source.this, catalog=catalog)})
-                source.replace(sge.to_table(alias))
+                # a subquery or an outer reference: a filter after the join
+                late.append(condition)
+            else:
+                local.append(condition)
+        if late and how != "inner":
+            raise _unsupported(
+                join, scope, "A subquery or outer reference in an outer join condition"
+            )
+        deferred.extend(late)
+        predicates = [convert(condition, scope) for condition in local]
+        rname = "{name}_" + alias
+        if predicates:
+            rel = rel.join(right, predicates, how=how, rname=rname)
+        elif how == "inner":
+            rel = rel.cross_join(right, rname=rname)
+        else:
+            rel = rel.join(right, how=how, rname=rname)
+        _map_member(scope.members[alias], right, rel)
+        scope.rebind(rel)
+        bound = visible
+    return rel, deferred + where
 
-    plan = sgp.Plan(select)
-    return convert(plan.root, catalog=catalog)
+
+# relations the SQL compiler may merge into their parent SELECT, which loses
+# the alias a correlated scalar subquery refers to
+_MERGEABLE = (
+    ops.Project,
+    ops.Filter,
+    ops.Sort,
+    ops.Distinct,
+    ops.DropColumns,
+    ops.FillNull,
+    ops.DropNull,
+)
+
+
+def _anchor(scope, nodes) -> None:
+    """Give the relation a stable alias if ``nodes`` correlate a scalar subquery to it."""
+    if scope.rel is None or not isinstance(scope.rel.op(), _MERGEABLE):
+        return
+    for root in nodes:
+        for select in root.find_all(sge.Select):
+            node = select.parent
+            while node is not None:
+                if isinstance(node, (sge.Exists, sge.In, sge.Any, sge.All)):
+                    # these keep the parent SELECT from being merged
+                    break
+                if node is root:
+                    if any(
+                        column.table in scope.members
+                        for column in select.find_all(sge.Column)
+                    ):
+                        scope.rebind(scope.rel.view())
+                        return
+                    break
+                node = node.parent
+
+
+def _metric_units(roots):
+    """Aggregate calls of this SELECT (with any FILTER) that are not window functions."""
+    units = []
+    for root in roots:
+        for node in root.walk(
+            prune=lambda n, root=root: (
+                n is not root and isinstance(n, (sge.Select, sge.Subquery))
+            )
+        ):
+            if not isinstance(node, sge.AggFunc):
+                continue
+            unit = node.parent if isinstance(node.parent, sge.Filter) else node
+            if isinstance(unit.parent, sge.Window) or unit in units:
+                continue
+            units.append(unit)
+    return units
+
+
+def _aggregate(select, scope, units) -> None:
+    """Aggregate the relation; later clauses find their expressions by lookup."""
+    group = select.args.get("group")
+    expressions = list(group.expressions) if group is not None else []
+    aliases = {}
+    for item in select.expressions:
+        if isinstance(item, sge.Alias):
+            aliases.setdefault(_unparen(item.this), item.alias)
+    taken = set()
+
+    def fresh(name):
+        base, n = name, 0
+        while name in taken:
+            n += 1
+            name = f"{base}_{n}"
+        taken.add(name)
+        return name
+
+    memo, group_columns, groups = {}, {}, []
+    for i, expression in enumerate(expressions):
+        expression = _unparen(expression)
+        if isinstance(expression, sge.Column):
+            name = fresh(expression.name)
+            group_columns[(expression.table, expression.name)] = name
+        else:
+            name = fresh(aliases.get(expression, f"_group_{i}"))
+        groups.append(convert(expression, scope).name(name))
+        memo[expression] = name
+    metrics = []
+    for i, unit in enumerate(units):
+        alias = aliases.get(unit)
+        name = fresh(alias if alias is not None and alias not in taken else f"_agg_{i}")
+        metrics.append(convert(unit, scope).name(name))
+        memo[unit] = name
+    rel = scope.rel.aggregate(metrics, by=groups)
+    scope.agg = _Aggregation(memo, group_columns)
+    scope.rebind(rel)
+
+
+def _has_bare_reduction(op) -> bool:
+    if isinstance(op, ops.Reduction):
+        return True
+    if not isinstance(op, ops.Value) or isinstance(
+        op, (ops.WindowFunction, ops.Subquery)
+    ):
+        return False
+    return any(_has_bare_reduction(child) for child in op.__children__)
+
+
+def _check_no_reductions(values, select, scope) -> None:
+    # an aggregate the SELECT did not account for would be turned into a window
+    # function or a scalar subquery by Ibis instead of raising
+    for value in values:
+        if _has_bare_reduction(value.op()):
+            raise com.IbisError(
+                "parse_sql did not account for an aggregate in "
+                f"{select.sql(dialect=scope.root.dialect)}"
+            )
+
+
+def _finish(rel):
+    return ir.Table(rel.op()) if isinstance(rel, ir.Join) else rel
+
+
+def _is_plain(value) -> bool:
+    """Whether ``value`` is free of window functions, aggregates and subqueries."""
+
+    def plain(op):
+        if isinstance(op, (ops.WindowFunction, ops.Reduction, ops.Subquery)):
+            return False
+        return not isinstance(op, ops.Value) or all(map(plain, op.__children__))
+
+    return plain(value.op())
+
+
+def _is_identity(values, rel) -> bool:
+    """Whether ``values`` are exactly the columns of ``rel``, in order."""
+    if len(values) != len(rel.columns):
+        return False
+    for value, name in zip(values, rel.columns):
+        if value.get_name() != name:
+            return False
+        op = value.op()
+        if isinstance(op, ops.Alias):
+            op = op.arg
+        if not (isinstance(op, ops.Field) and op.rel == rel.op() and op.name == name):
+            return False
+    return True
+
+
+def _project(rel, values, elide=True):
+    if elide and _is_identity(values, rel):
+        return rel
+    if isinstance(rel, ir.Join) and all(_is_plain(value) for value in values):
+        # a plain projection of the join's members is the join's own output
+        return rel.select(values)
+    return _finish(rel).select(values)
+
+
+def _order_by(order, scope, proj, values, distinct):
+    scope.outputs = {value.get_name(): value for value in values}
+    keys = [convert(key, scope) for key in order.expressions]
+    try:
+        return proj.order_by(keys)
+    except com.IntegrityError:
+        if distinct:
+            raise
+    # a sort key the SELECT list does not carry (``SELECT a FROM t ORDER BY
+    # c``): sort the projection extended with the keys, then drop them
+    names = [value.get_name() for value in values]
+    extra, resorted = [], []
+    for i, key in enumerate(keys):
+        op = key.op()
+        name = f"_sort_{i}"
+        extra.append(op.arg.to_expr().name(name))
+        resorted.append((name, op.ascending, op.nulls_first))
+    extended = _finish(scope.rel).select(values + extra)
+    return extended.order_by(
+        [
+            ibis.asc(extended[name], nulls_first=nulls_first)
+            if ascending
+            else ibis.desc(extended[name], nulls_first=nulls_first)
+            for name, ascending, nulls_first in resorted
+        ]
+    ).select(names)
+
+
+def _limit(node, rel, scope):
+    limit = node.args.get("limit")
+    offset = node.args.get("offset")
+    if limit is None and offset is None:
+        return rel
+    n = None if limit is None else _int(limit.expression, scope)
+    return rel.limit(n, offset=0 if offset is None else _int(offset.expression, scope))
+
+
+_UNSUPPORTED_SELECT_ARGS = {
+    "qualify": "QUALIFY",
+    "laterals": "LATERAL",
+    "pivots": "PIVOT",
+    "sample": "TABLESAMPLE",
+    "locks": "FOR UPDATE",
+    "connect": "CONNECT BY",
+    "match": "MATCH_RECOGNIZE",
+    "prewhere": "PREWHERE",
+    "distribute": "DISTRIBUTE BY",
+    "sort": "SORT BY",
+    "cluster": "CLUSTER BY",
+    "into": "SELECT INTO",
+}
+_UNSUPPORTED_GROUP_ARGS = {
+    "rollup": "ROLLUP",
+    "cube": "CUBE",
+    "grouping_sets": "GROUPING SETS",
+    "totals": "WITH TOTALS",
+    "all": "GROUP BY ALL",
+}
+
+
+def _reject_unsupported(select, scope) -> None:
+    for arg, what in _UNSUPPORTED_SELECT_ARGS.items():
+        if value := select.args.get(arg):
+            node = value if isinstance(value, sge.Expression) else select
+            raise _unsupported(node, scope, what)
+    if (distinct := select.args.get("distinct")) is not None and distinct.args.get(
+        "on"
+    ):
+        raise _unsupported(distinct, scope, "DISTINCT ON")
+    if (group := select.args.get("group")) is not None:
+        for arg, what in _UNSUPPORTED_GROUP_ARGS.items():
+            if group.args.get(arg):
+                raise _unsupported(group, scope, what)
+
+
+def _bind_ctes(node, scope) -> None:
+    if (with_ := _arg(node, "with_", "with")) is None:
+        return
+    if with_.args.get("recursive"):
+        raise _unsupported(with_, scope, "WITH RECURSIVE")
+    for cte in with_.expressions:
+        table = convert_relation(cte.this, scope.child())
+        alias = cte.args.get("alias")
+        columns = [column.name for column in alias.columns] if alias is not None else []
+        if columns and columns != list(table.columns):
+            table = table.rename(dict(zip(columns, table.columns)))
+        scope.ctes[cte.alias] = table
+
+
+def convert_relation(node, scope, **kwargs):
+    """Convert a query (SELECT, set operation or parenthesized query) to a table."""
+    if isinstance(node, sge.Select):
+        return convert_select(node, scope, **kwargs)
+    if isinstance(node, _SET_OPERATION):
+        return convert_set_operation(node, scope)
+    if isinstance(node, sge.Subquery):
+        return convert_relation(node.this, scope, **kwargs)
+    raise _unsupported(node, scope)
+
+
+def convert_select(select, scope, *, projection=True, elide=True):
+    """Convert a SELECT against ``scope``.
+
+    With ``projection=False`` only the rows are kept (``EXISTS``). With
+    ``elide=False`` a projection is built even when it selects every column
+    (a scalar subquery needs one).
+    """
+    _reject_unsupported(select, scope)
+    _bind_ctes(select, scope)
+    scope.windows = {
+        window.this.name: window for window in select.args.get("windows") or ()
+    }
+    rel, conditions = _build_from(select, scope)
+    if rel is None:
+        return _convert_from_less(select, scope)
+    if conditions:
+        _anchor(scope, conditions)
+        scope.rebind(
+            scope.rel.filter([convert(condition, scope) for condition in conditions])
+        )
+
+    items = [
+        (item.this if isinstance(item, sge.Alias) else item, item.alias_or_name)
+        for item in select.expressions
+    ]
+    having = select.args.get("having")
+    order = select.args.get("order")
+    roots = [expression for expression, _ in items]
+    if having is not None:
+        roots.append(having.this)
+    if order is not None:
+        roots.extend(key.this for key in order.expressions)
+    units = _metric_units(roots)
+    if select.args.get("group") is not None or units:
+        _aggregate(select, scope, units)
+    if having is not None:
+        _anchor(scope, [having.this])
+        scope.rebind(scope.rel.filter(convert(having.this, scope)))
+    if not projection:
+        return scope.rel
+
+    _anchor(scope, [expression for expression, _ in items])
+    values = _unique_names(
+        [convert(expression, scope).name(name) for expression, name in items]
+    )
+    _check_no_reductions(values, select, scope)
+    distinct = select.args.get("distinct") is not None
+    rel = _project(scope.rel, values, elide=elide)
+    if distinct:
+        rel = rel.distinct()
+    if order is not None:
+        rel = _order_by(order, scope, rel, values, distinct)
+    return _limit(select, rel, scope)
+
+
+def _convert_from_less(select, scope):
+    # ``SELECT 1 AS x`` has no FROM clause
+    values = {}
+    for item in select.expressions:
+        expression = item.this if isinstance(item, sge.Alias) else item
+        op = convert(expression, scope).op()
+        values[item.alias_or_name] = op.arg if isinstance(op, ops.Alias) else op
+    rel = ops.DummyTable(values).to_expr()
+    scope.rebind(rel)
+    if where := _conjuncts(select.args.get("where")):
+        rel = rel.filter([convert(condition, scope) for condition in where])
+    return _limit(select, rel, scope)
 
 
 _set_operations = {
@@ -745,73 +705,76 @@ def _align_set_operands(left, right):
     return left.select(left_values), right.select(right_values)
 
 
-def _is_inlined_source(subquery, select) -> bool:
-    """Whether the planner inlines ``subquery`` into the plan of ``select``.
-
-    Derived tables (``FROM (...) AS s``) are inlined, however deeply nested;
-    subqueries in expressions (``IN (...)``, ``EXISTS (...)``) are planned
-    separately when that expression is converted.
-    """
-    node = subquery
-    while node is not select:
-        if isinstance(node, sge.Subquery) and not isinstance(
-            node.parent, (sge.From, sge.Join)
-        ):
-            return False
-        if (node := node.parent) is None:
-            return False
-    return True
-
-
-def convert_set_operation(setop, catalog):
-    left = convert(setop.left, catalog=catalog)
-    right = convert(setop.right, catalog=catalog)
+def convert_set_operation(setop, scope):
+    _bind_ctes(setop, scope)
+    if setop.args.get("by_name"):
+        raise _unsupported(setop, scope, "A set operation BY NAME")
+    if (method := _set_operations.get(type(setop))) is None:
+        raise _unsupported(setop, scope)
+    left = convert_relation(setop.left, scope.child())
+    right = convert_relation(setop.right, scope.child())
     if left.schema() != right.schema():
         left, right = _align_set_operands(left, right)
-    method = _set_operations[type(setop)]
-    distinct = bool(setop.args.get("distinct"))
-    table = getattr(left, method)(right, distinct=distinct)
+    table = getattr(left, method)(right, distinct=bool(setop.args.get("distinct")))
 
     if (order := setop.args.get("order")) is not None:
-        table = table.order_by(
-            [convert(key, catalog=None) for key in order.expressions]
+        keys = scope.child()
+        keys.rel = table
+        keys.outputs = {name: table[name] for name in table.columns}
+        table = table.order_by([convert(key, keys) for key in order.expressions])
+    return _limit(setop, table, scope)
+
+
+@singledispatch
+def _convert(node, scope):
+    raise _unsupported(node, scope)
+
+
+def convert(node, scope):
+    """Convert a value expression against ``scope``."""
+    if scope.agg is not None and (name := scope.agg.memo.get(node)) is not None:
+        # an aggregate or GROUP BY expression computed by the aggregate
+        return scope.rel[name]
+    return _convert(node, scope)
+
+
+@_convert.register(sge.Subquery)
+def convert_subquery(subquery, scope):
+    table = convert_relation(subquery.this, scope.child(), elide=False)
+    if len(table.columns) != 1:
+        raise com.IbisInputError(
+            f"A scalar subquery must return one column: {subquery.sql(dialect=scope.root.dialect)}"
         )
+    return table.as_scalar()
 
-    limit = setop.args.get("limit")
-    offset = setop.args.get("offset")
-    if limit is not None or offset is not None:
-        table = table.limit(
-            None if limit is None else int(limit.expression.name),
-            offset=0 if offset is None else int(offset.expression.name),
+
+@_convert.register(sge.Exists)
+def convert_exists(exists, scope):
+    rel = convert_relation(exists.this, scope.child(), projection=False)
+    return ops.ExistsSubquery(rel.op()).to_expr()
+
+
+def _single_column(node, scope):
+    table = convert_relation(node, scope.child())
+    if len(table.columns) != 1:
+        raise com.IbisInputError(
+            f"The subquery must return one column: {node.sql(dialect=scope.root.dialect)}"
         )
-
-    return table
-
-
-@convert.register(sge.Subquery)
-def convert_subquery(subquery, catalog):
-    return convert_select(subquery.this, catalog)
+    (name,) = table.columns
+    return table[name]
 
 
-def _scalar(value):
-    """A (possibly parenthesized) subquery used as a value is a scalar subquery."""
-    if isinstance(value, ir.Table):
-        (name,) = value.columns
-        return value[name].as_scalar()
-    return value
+@_convert.register(sge.Filter)
+def convert_filtered_aggregate(node, scope):
+    value = convert(node.this, scope)
+    if not isinstance(op := value.op(), ops.Reduction):
+        raise _unsupported(node, scope, "FILTER on a non-aggregate function")
+    where = convert(node.expression.this, scope)
+    return op.copy(where=where.op()).to_expr()
 
 
-@convert.register(sge.Exists)
-def convert_exists(exists, catalog):
-    inner = exists.this
-    if isinstance(inner, sge.Subquery):
-        inner = inner.this
-    table = convert_select(inner, catalog)
-    return ops.ExistsSubquery(table.op()).to_expr()
-
-
-@convert.register(sge.Literal)
-def convert_literal(literal, catalog):
+@_convert.register(sge.Literal)
+def convert_literal(literal, scope):
     value = literal.this
     if literal.is_int:
         value = int(value)
@@ -820,35 +783,30 @@ def convert_literal(literal, catalog):
     return ibis.literal(value)
 
 
-@convert.register(sge.Boolean)
-def convert_boolean(boolean, catalog):
+@_convert.register(sge.Boolean)
+def convert_boolean(boolean, scope):
     return ibis.literal(boolean.this)
 
 
-@convert.register(sge.Null)
-def convert_null(null, catalog):
+@_convert.register(sge.Null)
+def convert_null(null, scope):
     return ibis.null()
 
 
-@convert.register(sge.Alias)
-def convert_alias(alias, catalog):
-    this = convert(alias.this, catalog=catalog)
+@_convert.register(sge.Alias)
+def convert_alias(alias, scope):
+    this = convert(alias.this, scope=scope)
     return this.name(alias.alias)
 
 
-@convert.register(sge.Column)
-def convert_column(column, catalog):
-    # unqualified columns are the planner's generated ones (``_a_0``, ``_o_0``)
-    return catalog.column(column.table, column.name)
+@_convert.register(sge.Column)
+def convert_column(column, scope):
+    return scope.column(column.table, column.name)
 
 
-@convert.register(sge.Ordered)
-def convert_ordered(ordered, catalog):
-    if catalog is None:
-        # sort steps refer to the columns of the sorted relation by name
-        this = ibis._[ordered.this.name]
-    else:
-        this = convert(ordered.this, catalog=catalog)
+@_convert.register(sge.Ordered)
+def convert_ordered(ordered, scope):
+    this = convert(_unparen(ordered.this), scope=scope)
     desc = ordered.args.get("desc", False)  # not exposed as an attribute
     nulls_first = ordered.args.get("nulls_first", False)
     return (
@@ -865,10 +823,11 @@ _unary_operations = {
 }
 
 
-@convert.register(sge.Unary)
-def convert_unary(unary, catalog):
-    op = _unary_operations[type(unary)]
-    this = convert(unary.this, catalog=catalog)
+@_convert.register(sge.Unary)
+def convert_unary(unary, scope):
+    if (op := _unary_operations.get(type(unary))) is None:
+        raise _unsupported(unary, scope)
+    this = convert(unary.this, scope=scope)
     return op(this)
 
 
@@ -890,50 +849,66 @@ _binary_operations = {
 }
 
 
-@convert.register(sge.Binary)
-def convert_binary(binary, catalog):
-    op = _binary_operations[type(binary)]
-    this = convert(binary.this, catalog=catalog)
-    expr = convert(binary.expression, catalog=catalog)
-
-    this = _scalar(this)
-    expr = _scalar(expr)
-
-    # the planner writes join conditions as ``TRUE AND <condition>``
-    if isinstance(binary, sge.And):
-        if _is_true(this):
-            return expr
-        if _is_true(expr):
-            return this
-
-    return op(this, expr)
+_COMPARISONS = (sge.LT, sge.LTE, sge.GT, sge.GTE, sge.EQ, sge.NEQ)
 
 
-@convert.register(sge.Is)
-def convert_is(is_, catalog):
-    this = convert(is_.this, catalog=catalog)
+def _convert_quantified(binary, scope):
+    quantifier = binary.expression
+    if isinstance(binary, sge.EQ) and isinstance(quantifier, sge.Any):
+        return convert(binary.this, scope).isin(_single_column(quantifier.this, scope))
+    if isinstance(binary, sge.NEQ) and isinstance(quantifier, sge.All):
+        return ~convert(binary.this, scope).isin(_single_column(quantifier.this, scope))
+    raise _unsupported(binary, scope, "ANY or ALL with this operator")
+
+
+@_convert.register(sge.Binary)
+def convert_binary(binary, scope):
+    if (op := _binary_operations.get(type(binary))) is None:
+        raise _unsupported(binary, scope)
+    left, right = binary.this, binary.expression
+    if isinstance(right, (sge.Any, sge.All)):
+        return _convert_quantified(binary, scope)
+    if isinstance(left, sge.Null) or isinstance(right, sge.Null):
+        # SQL's NULL compares to and computes with everything as NULL; Ibis
+        # would read ``x = NULL`` as ``x IS NULL``
+        if isinstance(binary, _COMPARISONS):
+            return ibis.null(dt.boolean)
+        if isinstance(binary, (sge.And, sge.Or)):
+            null = ibis.null(dt.boolean)
+            return op(
+                null if isinstance(left, sge.Null) else convert(left, scope),
+                null if isinstance(right, sge.Null) else convert(right, scope),
+            )
+        other = convert(right if isinstance(left, sge.Null) else left, scope)
+        return ibis.null(other.type())
+    return op(convert(left, scope), convert(right, scope))
+
+
+@_convert.register(sge.Is)
+def convert_is(is_, scope):
+    this = convert(is_.this, scope=scope)
     if isinstance(is_.expression, sge.Null):
         return this.isnull()
-    return this == convert(is_.expression, catalog=catalog)
+    return this == convert(is_.expression, scope=scope)
 
 
-@convert.register(sge.Like)
-def convert_like(like, catalog):
-    this = convert(like.this, catalog=catalog)
-    return this.like(convert(like.expression, catalog=catalog))
+@_convert.register(sge.Like)
+def convert_like(like, scope):
+    this = convert(like.this, scope=scope)
+    return this.like(convert(like.expression, scope=scope))
 
 
-@convert.register(sge.ILike)
-def convert_ilike(like, catalog):
-    this = convert(like.this, catalog=catalog)
-    return this.ilike(convert(like.expression, catalog=catalog))
+@_convert.register(sge.ILike)
+def convert_ilike(like, scope):
+    this = convert(like.this, scope=scope)
+    return this.ilike(convert(like.expression, scope=scope))
 
 
-@convert.register(sge.Between)
-def convert_between(between, catalog):
-    this = convert(between.this, catalog=catalog)
-    low = convert(between.args["low"], catalog=catalog)
-    high = convert(between.args["high"], catalog=catalog)
+@_convert.register(sge.Between)
+def convert_between(between, scope):
+    this = convert(between.this, scope=scope)
+    low = convert(between.args["low"], scope=scope)
+    high = convert(between.args["high"], scope=scope)
     return this.between(low, high)
 
 
@@ -947,37 +922,38 @@ _reduction_methods = {
 }
 
 
-@convert.register(sge.AggFunc)
-def convert_reduction(reduction, catalog):
-    method = _reduction_methods[type(reduction)]
-    this = convert(reduction.this, catalog=catalog)
+@_convert.register(sge.AggFunc)
+def convert_reduction(reduction, scope):
+    if (method := _reduction_methods.get(type(reduction))) is None:
+        raise _unsupported(reduction, scope)
+    this = convert(reduction.this, scope=scope)
     return getattr(this, method)()
 
 
-@convert.register(sge.Stddev)
-@convert.register(sge.StddevSamp)
-def convert_stddev_samp(reduction, catalog):
-    return convert(reduction.this, catalog=catalog).std(how="sample")
+@_convert.register(sge.Stddev)
+@_convert.register(sge.StddevSamp)
+def convert_stddev_samp(reduction, scope):
+    return convert(reduction.this, scope=scope).std(how="sample")
 
 
-@convert.register(sge.StddevPop)
-def convert_stddev_pop(reduction, catalog):
-    return convert(reduction.this, catalog=catalog).std(how="pop")
+@_convert.register(sge.StddevPop)
+def convert_stddev_pop(reduction, scope):
+    return convert(reduction.this, scope=scope).std(how="pop")
 
 
-@convert.register(sge.Variance)
-def convert_variance_samp(reduction, catalog):
-    return convert(reduction.this, catalog=catalog).var(how="sample")
+@_convert.register(sge.Variance)
+def convert_variance_samp(reduction, scope):
+    return convert(reduction.this, scope=scope).var(how="sample")
 
 
-@convert.register(sge.VariancePop)
-def convert_variance_pop(reduction, catalog):
-    return convert(reduction.this, catalog=catalog).var(how="pop")
+@_convert.register(sge.VariancePop)
+def convert_variance_pop(reduction, scope):
+    return convert(reduction.this, scope=scope).var(how="pop")
 
 
-@convert.register(sge.ApproxDistinct)
-def convert_approx_distinct(reduction, catalog):
-    return convert(reduction.this, catalog=catalog).approx_nunique()
+@_convert.register(sge.ApproxDistinct)
+def convert_approx_distinct(reduction, scope):
+    return convert(reduction.this, scope=scope).approx_nunique()
 
 
 _ranking_functions = {
@@ -989,12 +965,12 @@ _ranking_functions = {
 }
 
 
-@convert.register(sge.RowNumber)
-@convert.register(sge.Rank)
-@convert.register(sge.DenseRank)
-@convert.register(sge.PercentRank)
-@convert.register(sge.CumeDist)
-def convert_ranking(func, catalog):
+@_convert.register(sge.RowNumber)
+@_convert.register(sge.Rank)
+@_convert.register(sge.DenseRank)
+@_convert.register(sge.PercentRank)
+@_convert.register(sge.CumeDist)
+def convert_ranking(func, scope):
     result = getattr(ibis, _ranking_functions[type(func)])()
     if isinstance(func, (sge.RowNumber, sge.Rank, sge.DenseRank)):
         # SQL's ranking functions are 1-based, Ibis's are 0-based
@@ -1002,40 +978,40 @@ def convert_ranking(func, catalog):
     return result
 
 
-@convert.register(sge.Ntile)
-def convert_ntile(ntile, catalog):
+@_convert.register(sge.Ntile)
+def convert_ntile(ntile, scope):
     # SQL's NTILE is 1-based, Ibis's is 0-based
-    return ibis.ntile(convert(ntile.this, catalog=catalog)) + 1
+    return ibis.ntile(convert(ntile.this, scope=scope)) + 1
 
 
-@convert.register(sge.Lag)
-@convert.register(sge.Lead)
-def convert_lag_lead(func, catalog):
-    this = convert(func.this, catalog=catalog)
+@_convert.register(sge.Lag)
+@_convert.register(sge.Lead)
+def convert_lag_lead(func, scope):
+    this = convert(func.this, scope=scope)
     offset = func.args.get("offset")
     default = func.args.get("default")
     method = "lag" if isinstance(func, sge.Lag) else "lead"
     return getattr(this, method)(
-        None if offset is None else convert(offset, catalog=catalog),
-        None if default is None else convert(default, catalog=catalog),
+        None if offset is None else convert(offset, scope=scope),
+        None if default is None else convert(default, scope=scope),
     )
 
 
-@convert.register(sge.FirstValue)
-def convert_first_value(func, catalog):
-    return convert(func.this, catalog=catalog).first()
+@_convert.register(sge.FirstValue)
+def convert_first_value(func, scope):
+    return convert(func.this, scope=scope).first()
 
 
-@convert.register(sge.LastValue)
-def convert_last_value(func, catalog):
-    return convert(func.this, catalog=catalog).last()
+@_convert.register(sge.LastValue)
+def convert_last_value(func, scope):
+    return convert(func.this, scope=scope).last()
 
 
-@convert.register(sge.NthValue)
-def convert_nth_value(func, catalog):
-    this = convert(func.this, catalog=catalog)
+@_convert.register(sge.NthValue)
+def convert_nth_value(func, scope):
+    this = convert(func.this, scope=scope)
     # SQL's NTH_VALUE is 1-based, ``nth`` is 0-based
-    return this.nth(convert(func.args["offset"], catalog=catalog) - 1)
+    return this.nth(convert(func.args["offset"], scope=scope) - 1)
 
 
 def _window_bound(value, side):
@@ -1051,18 +1027,27 @@ def _window_bound(value, side):
     return -offset if (side or "").upper() == "PRECEDING" else offset
 
 
-@convert.register(sge.Window)
-def convert_window(window, catalog):
-    func = convert(window.this, catalog=catalog)
+@_convert.register(sge.Window)
+def convert_window(window, scope):
+    source = window
+    if (alias := window.args.get("alias")) is not None and not (
+        window.args.get("partition_by")
+        or window.args.get("order")
+        or window.args.get("spec")
+    ):
+        # ``OVER w`` refers to the WINDOW clause
+        if (source := scope.windows.get(alias.name)) is None:
+            raise _unsupported(window, scope, f"The window {alias.name!r}")
+    func = convert(window.this, scope=scope)
     group_by = [
-        convert(part, catalog=catalog) for part in window.args.get("partition_by") or ()
+        convert(part, scope=scope) for part in source.args.get("partition_by") or ()
     ]
     order_by = []
-    if (order := window.args.get("order")) is not None:
-        order_by = [convert(key, catalog=catalog) for key in order.expressions]
+    if (order := source.args.get("order")) is not None:
+        order_by = [convert(key, scope=scope) for key in order.expressions]
 
     kwargs = {}
-    if (spec := window.args.get("spec")) is not None:
+    if (spec := source.args.get("spec")) is not None:
         start = _window_bound(spec.args.get("start"), spec.args.get("start_side"))
         end = _window_bound(spec.args.get("end"), spec.args.get("end_side"))
         kind = (spec.args.get("kind") or "ROWS").upper()
@@ -1089,66 +1074,66 @@ _truncation_units = {
 }
 
 
-@convert.register(sge.TimestampTrunc)
-@convert.register(sge.DateTrunc)
-def convert_truncate(trunc, catalog):
-    this = convert(trunc.this, catalog=catalog)
+@_convert.register(sge.TimestampTrunc)
+@_convert.register(sge.DateTrunc)
+def convert_truncate(trunc, scope):
+    this = convert(trunc.this, scope=scope)
     unit = trunc.args["unit"].name.lower().removesuffix("s")
     return this.truncate(_truncation_units[unit])
 
 
-@convert.register(sge.Round)
-def convert_round(func, catalog):
-    this = convert(func.this, catalog=catalog)
+@_convert.register(sge.Round)
+def convert_round(func, scope):
+    this = convert(func.this, scope=scope)
     if (decimals := func.args.get("decimals")) is not None:
-        return this.round(convert(decimals, catalog=catalog))
+        return this.round(convert(decimals, scope=scope))
     return this.round()
 
 
-@convert.register(sge.Abs)
-def convert_abs(func, catalog):
-    return convert(func.this, catalog=catalog).abs()
+@_convert.register(sge.Abs)
+def convert_abs(func, scope):
+    return convert(func.this, scope=scope).abs()
 
 
-@convert.register(sge.Floor)
-def convert_floor(func, catalog):
-    return convert(func.this, catalog=catalog).floor()
+@_convert.register(sge.Floor)
+def convert_floor(func, scope):
+    return convert(func.this, scope=scope).floor()
 
 
-@convert.register(sge.Ceil)
-def convert_ceil(func, catalog):
-    return convert(func.this, catalog=catalog).ceil()
+@_convert.register(sge.Ceil)
+def convert_ceil(func, scope):
+    return convert(func.this, scope=scope).ceil()
 
 
-@convert.register(sge.Sqrt)
-def convert_sqrt(func, catalog):
-    return convert(func.this, catalog=catalog).sqrt()
+@_convert.register(sge.Sqrt)
+def convert_sqrt(func, scope):
+    return convert(func.this, scope=scope).sqrt()
 
 
-@convert.register(sge.Ln)
-def convert_ln(func, catalog):
-    return convert(func.this, catalog=catalog).ln()
+@_convert.register(sge.Ln)
+def convert_ln(func, scope):
+    return convert(func.this, scope=scope).ln()
 
 
-@convert.register(sge.Greatest)
-def convert_greatest(func, catalog):
+@_convert.register(sge.Greatest)
+def convert_greatest(func, scope):
     return ibis.greatest(
-        convert(func.this, catalog=catalog),
-        *(convert(e, catalog=catalog) for e in func.expressions),
+        convert(func.this, scope=scope),
+        *(convert(e, scope=scope) for e in func.expressions),
     )
 
 
-@convert.register(sge.Least)
-def convert_least(func, catalog):
+@_convert.register(sge.Least)
+def convert_least(func, scope):
     return ibis.least(
-        convert(func.this, catalog=catalog),
-        *(convert(e, catalog=catalog) for e in func.expressions),
+        convert(func.this, scope=scope),
+        *(convert(e, scope=scope) for e in func.expressions),
     )
 
 
-@convert.register(sge.Concat)
-def convert_concat(func, catalog):
-    args = [convert(e, catalog=catalog) for e in func.expressions]
+@_convert.register(sge.Concat)
+def convert_concat(func, scope):
+    args = [convert(e, scope=scope) for e in func.expressions]
     if func.args.get("safe"):
         # CONCAT() skips NULL arguments where ``||`` propagates them
         args = [ibis.coalesce(arg, "") for arg in args]
@@ -1158,97 +1143,100 @@ def convert_concat(func, catalog):
     return first
 
 
-@convert.register(sge.DPipe)
-def convert_dpipe(func, catalog):
-    return convert(func.this, catalog=catalog) + convert(
-        func.expression, catalog=catalog
-    )
+@_convert.register(sge.DPipe)
+def convert_dpipe(func, scope):
+    return convert(func.this, scope=scope) + convert(func.expression, scope=scope)
 
 
-@convert.register(sge.Trim)
-def convert_trim(func, catalog):
-    return convert(func.this, catalog=catalog).strip()
+@_convert.register(sge.Trim)
+def convert_trim(func, scope):
+    return convert(func.this, scope=scope).strip()
 
 
-@convert.register(sge.Initcap)
-def convert_initcap(func, catalog):
-    return convert(func.this, catalog=catalog).capitalize()
+@_convert.register(sge.Initcap)
+def convert_initcap(func, scope):
+    return convert(func.this, scope=scope).capitalize()
 
 
-@convert.register(sge.If)
-def convert_if(func, catalog):
-    cond = convert(func.this, catalog=catalog)
-    true = convert(func.args["true"], catalog=catalog)
+@_convert.register(sge.If)
+def convert_if(func, scope):
+    cond = convert(func.this, scope=scope)
+    true = convert(func.args["true"], scope=scope)
     false = func.args.get("false")
-    return cond.ifelse(true, None if false is None else convert(false, catalog=catalog))
+    return cond.ifelse(true, None if false is None else convert(false, scope=scope))
 
 
-@convert.register(sge.Count)
-def convert_count(count, catalog):
+@_convert.register(sge.Count)
+def convert_count(count, scope):
     this = count.this
     if this is None or isinstance(this, sge.Star):
-        return ibis._.count()
+        return scope.rel.count() if scope.rel is not None else ibis._.count()
     if isinstance(this, sge.Distinct):
         (this,) = this.expressions
-        return convert(this, catalog=catalog).nunique()
-    return convert(this, catalog=catalog).count()
+        return convert(this, scope=scope).nunique()
+    return convert(this, scope=scope).count()
 
 
-@convert.register(sge.In)
-def convert_in(in_, catalog):
-    this = convert(in_.this, catalog=catalog)
+@_convert.register(sge.In)
+def convert_in(in_, scope):
+    this = convert(in_.this, scope=scope)
     if (query := in_.args.get("query")) is not None:
-        table = convert(query, catalog=catalog)
-        (name,) = table.columns
-        return this.isin(table[name])
-    candidates = [convert(expression, catalog) for expression in in_.expressions]
+        return this.isin(_single_column(query, scope))
+    candidates = [convert(expression, scope) for expression in in_.expressions]
     return this.isin(candidates)
 
 
-@convert.register(sge.Cast)
-def convert_cast(cast, catalog):
-    this = convert(cast.this, catalog)
-    to = convert(cast.to, catalog)
+@_convert.register(sge.Cast)
+def convert_cast(cast, scope):
+    this = convert(cast.this, scope)
+    to = convert(cast.to, scope)
 
     return this.cast(to)
 
 
-@convert.register(sge.DataType)
-def convert_datatype(datatype, catalog):
+@_convert.register(sge.TryCast)
+def convert_try_cast(cast, scope):
+    return convert(cast.this, scope).try_cast(convert(cast.to, scope))
+
+
+@_convert.register(sge.DataType)
+def convert_datatype(datatype, scope):
     return SqlglotType().to_ibis(datatype)
 
 
-@convert.register(sge.Case)
-def convert_case(case, catalog):
+@_convert.register(sge.Case)
+def convert_case(case, scope):
     branches = [
         (
-            _scalar(convert(if_.this, catalog=catalog)),
-            _scalar(convert(if_.args["true"], catalog=catalog)),
+            convert(if_.this, scope=scope),
+            convert(if_.args["true"], scope=scope),
         )
         for if_ in case.args["ifs"]
     ]
     default = case.args.get("default")
-    else_ = None if default is None else _scalar(convert(default, catalog=catalog))
+    else_ = None if default is None else convert(default, scope=scope)
     if (base := case.this) is not None:
-        return convert(base, catalog=catalog).cases(*branches, else_=else_)
+        return convert(base, scope=scope).cases(*branches, else_=else_)
     return ibis.cases(*branches, else_=else_)
 
 
-@convert.register(sge.Substring)
-def convert_substring(substring, catalog):
-    this = convert(substring.this, catalog=catalog)
+@_convert.register(sge.Substring)
+def convert_substring(substring, scope):
+    this = convert(substring.this, scope=scope)
     # SQL substrings are 1-based
-    start = convert(substring.args["start"], catalog=catalog) - 1
+    start = convert(substring.args["start"], scope=scope) - 1
     if (length := substring.args.get("length")) is not None:
-        return this.substr(start, convert(length, catalog=catalog))
+        return this.substr(start, convert(length, scope=scope))
     return this.substr(start)
 
 
-@convert.register(sge.Extract)
-def convert_extract(extract, catalog):
+@_convert.register(sge.Extract)
+def convert_extract(extract, scope):
     unit = extract.this.name.lower()
-    this = convert(extract.expression, catalog=catalog)
-    return getattr(this, unit)()
+    this = convert(extract.expression, scope=scope)
+    if (method := getattr(this, unit, None)) is None:
+        raise _unsupported(extract, scope)
+    return method()
 
 
 _interval_units = {
@@ -1263,54 +1251,54 @@ _interval_units = {
 }
 
 
-@convert.register(sge.DateAdd)
-@convert.register(sge.DateSub)
-def convert_date_add(func, catalog):
-    this = convert(func.this, catalog=catalog)
+@_convert.register(sge.DateAdd)
+@_convert.register(sge.DateSub)
+def convert_date_add(func, scope):
+    this = convert(func.this, scope=scope)
     unit = func.args.get("unit")
     unit = "D" if unit is None else _interval_units[unit.name.lower().removesuffix("s")]
     if isinstance(func.expression, sge.Literal):
         interval = ibis.interval(int(func.expression.name), unit)
     else:
-        interval = convert(func.expression, catalog=catalog).as_interval(unit)
+        interval = convert(func.expression, scope=scope).as_interval(unit)
     return this - interval if isinstance(func, sge.DateSub) else this + interval
 
 
-@convert.register(sge.Interval)
-def convert_interval(interval, catalog):
+@_convert.register(sge.Interval)
+def convert_interval(interval, scope):
     unit = _interval_units[interval.args["unit"].name.lower().removesuffix("s")]
     if isinstance(interval.this, sge.Literal):
         return ibis.interval(int(interval.this.name), unit)
-    return convert(interval.this, catalog=catalog).as_interval(unit)
+    return convert(interval.this, scope=scope).as_interval(unit)
 
 
-@convert.register(sge.Nullif)
-def convert_nullif(nullif, catalog):
-    this = convert(nullif.this, catalog=catalog)
-    return this.nullif(convert(nullif.expression, catalog=catalog))
+@_convert.register(sge.Nullif)
+def convert_nullif(nullif, scope):
+    this = convert(nullif.this, scope=scope)
+    return this.nullif(convert(nullif.expression, scope=scope))
 
 
-@convert.register(sge.Coalesce)
-def convert_coalesce(coalesce, catalog):
-    args = [convert(coalesce.this, catalog=catalog)] + [
-        convert(e, catalog=catalog) for e in coalesce.expressions
+@_convert.register(sge.Coalesce)
+def convert_coalesce(coalesce, scope):
+    args = [convert(coalesce.this, scope=scope)] + [
+        convert(e, scope=scope) for e in coalesce.expressions
     ]
     return ibis.coalesce(*args)
 
 
-@convert.register(sge.Upper)
-def convert_upper(upper, catalog):
-    return convert(upper.this, catalog=catalog).upper()
+@_convert.register(sge.Upper)
+def convert_upper(upper, scope):
+    return convert(upper.this, scope=scope).upper()
 
 
-@convert.register(sge.Lower)
-def convert_lower(lower, catalog):
-    return convert(lower.this, catalog=catalog).lower()
+@_convert.register(sge.Lower)
+def convert_lower(lower, scope):
+    return convert(lower.this, scope=scope).lower()
 
 
-@convert.register(sge.Length)
-def convert_length(length, catalog):
-    return convert(length.this, catalog=catalog).length()
+@_convert.register(sge.Length)
+def convert_length(length, scope):
+    return convert(length.this, scope=scope).length()
 
 
 @public
@@ -1334,13 +1322,22 @@ def parse_sql(sqlstring, catalog, dialect=None):
 
     """
     catalog = Catalog(
-        bases={name: ibis.table(schema, name=name) for name, schema in catalog.items()}
+        {name: ibis.table(schema, name=name) for name, schema in catalog.items()}
     )
 
     expr = sg.parse_one(sqlstring, dialect)
-    tree = sgo.optimize(expr, catalog.to_sqlglot(), dialect=dialect, rules=RULES)
+    try:
+        tree = sgo.optimize(
+            expr,
+            catalog.to_sqlglot(),
+            dialect=dialect,
+            rules=RULES,
+            isolate_tables=False,
+        )
+    except sg.errors.OptimizeError as e:
+        raise com.IbisInputError(str(e)) from e
 
-    return convert(tree, catalog=catalog)
+    return convert_relation(tree, Scope(_Root(catalog, dialect)))
 
 
 class SQLString(str):

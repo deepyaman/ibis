@@ -38,6 +38,4 @@ agg = f.aggregate(
     by=[f.l_returnflag, f.l_linestatus],
 )
 
-result = agg.order_by(
-    agg.l_returnflag.asc(nulls_first=True), agg.l_linestatus.asc(nulls_first=True)
-)
+result = agg.order_by(agg.l_returnflag.asc(), agg.l_linestatus.asc())
