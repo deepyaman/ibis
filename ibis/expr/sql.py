@@ -992,16 +992,22 @@ def convert_is(is_, scope):
     return this == convert(is_.expression, scope=scope)
 
 
+def _convert_like(like, scope, method):
+    this = convert(like.this, scope=scope)
+    result = getattr(this, method)(convert(like.expression, scope=scope))
+    # sqlglot parses ``x NOT LIKE y`` as ``Like(negate=True)`` from 30.8 and as
+    # ``Not(Like)`` before; the argument is absent on the older releases
+    return ~result if like.args.get("negate") else result
+
+
 @_convert.register(sge.Like)
 def convert_like(like, scope):
-    this = convert(like.this, scope=scope)
-    return this.like(convert(like.expression, scope=scope))
+    return _convert_like(like, scope, "like")
 
 
 @_convert.register(sge.ILike)
 def convert_ilike(like, scope):
-    this = convert(like.this, scope=scope)
-    return this.ilike(convert(like.expression, scope=scope))
+    return _convert_like(like, scope, "ilike")
 
 
 @_convert.register(sge.Between)
