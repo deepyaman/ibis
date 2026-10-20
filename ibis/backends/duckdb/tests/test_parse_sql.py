@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import decimal
+
 import duckdb
 import pandas as pd
 import pytest
 
 import ibis
 import ibis.common.exceptions as com
+from ibis.tests.util import assert_same_result, decompile_roundtrip, expose_sort_keys
 
 pytest.importorskip("duckdb")
 
@@ -32,59 +35,6 @@ def duck():
     con.execute(f"CREATE TABLE t AS SELECT * FROM ({T_ROWS}) v(a, b, c, d, ts)")
     con.execute(f"CREATE TABLE u AS SELECT * FROM ({U_ROWS}) v(a, x)")
     return con
-
-
-def _kind(col: pd.Series) -> str:
-    """Classify a result column for comparison purposes."""
-    if not col.notna().any():
-        return "null"
-    if pd.api.types.is_datetime64_any_dtype(col) or (
-        col.dtype == object and col.dropna().map(lambda v: hasattr(v, "year")).all()
-    ):
-        return "datetime"
-    if pd.api.types.is_bool_dtype(col):
-        return "string"
-    if pd.api.types.is_numeric_dtype(col) or (
-        col.dtype == object
-        and pd.to_numeric(col, errors="coerce").notna().sum() == col.notna().sum()
-    ):
-        return "numeric"
-    return "string"
-
-
-def _normalize(col: pd.Series, kind: str) -> pd.Series:
-    if kind == "datetime":
-        return pd.to_datetime(col).dt.strftime("%Y-%m-%d %H:%M:%S").astype(object)
-    if kind == "numeric":
-        return pd.to_numeric(col).astype(float)
-    return col.astype(object).where(col.notna(), None).astype(str)
-
-
-def assert_same_rows(result: pd.DataFrame, expected: pd.DataFrame) -> None:
-    """Compare by position and value: SQL output names and row order are free.
-
-    Numbers are compared to two decimals: Ibis types the mean of a decimal
-    column as a decimal of the same scale where DuckDB computes a double.
-    """
-    assert result.shape == expected.shape
-    left, right = pd.DataFrame(), pd.DataFrame()
-    for i, (rcol, ecol) in enumerate(zip(result.columns, expected.columns)):
-        kinds = {_kind(result[rcol]), _kind(expected[ecol])} - {"null"}
-        kind = (
-            "numeric"
-            if kinds == {"numeric"}
-            else kinds.pop()
-            if len(kinds) == 1
-            else "string"
-        )
-        left[i] = _normalize(result[rcol], kind)
-        right[i] = _normalize(expected[ecol], kind)
-    numeric = [c for c in left.columns if left[c].dtype == float]
-    for frame in (left, right):
-        frame[numeric] = frame[numeric].round(2)
-    left = left.sort_values(list(left.columns), kind="stable").reset_index(drop=True)
-    right = right.sort_values(list(right.columns), kind="stable").reset_index(drop=True)
-    pd.testing.assert_frame_equal(left, right, check_exact=False, atol=0.011)
 
 
 CASES = {
@@ -221,33 +171,25 @@ UNSUPPORTED = {
 }
 
 
-def roundtrip(expr):
-    """Decompile `expr` to Python, run that code, and return what it builds."""
-    code = ibis.decompile(expr)
-    namespace = {}
-    exec(code, {}, namespace)  # noqa: S102
-    return namespace["result"]
+def assert_matches_duckdb(duck, expr, sql):
+    """Assert that ``expr`` computes what DuckDB computes for ``sql``."""
+    ordered_sql, sort_keys = expose_sort_keys(sql, dialect="duckdb")
+    expected = duck.execute(ordered_sql).df()
+    result = ibis.duckdb.from_connection(duck).to_pandas(expr)
+    assert_same_result(result, expected, sort_keys=sort_keys)
 
 
 @pytest.mark.parametrize("sql", list(CASES.values()), ids=list(CASES))
 def test_parse_sql_matches_duckdb(duck, sql):
     expr = ibis.parse_sql(sql, CATALOG, dialect="duckdb")
-
-    expected = duck.execute(sql).df()
-    result = ibis.duckdb.from_connection(duck).to_pandas(expr)
-
-    assert_same_rows(result, expected)
+    assert_matches_duckdb(duck, expr, sql)
 
 
 @pytest.mark.parametrize("sql", list(CASES.values()), ids=list(CASES))
 def test_decompile_roundtrip_matches_duckdb(duck, sql):
     """Parsed SQL decompiles to Python that rebuilds an equivalent expression."""
-    expr = roundtrip(ibis.parse_sql(sql, CATALOG, dialect="duckdb"))
-
-    expected = duck.execute(sql).df()
-    result = ibis.duckdb.from_connection(duck).to_pandas(expr)
-
-    assert_same_rows(result, expected)
+    expr = decompile_roundtrip(ibis.parse_sql(sql, CATALOG, dialect="duckdb"))
+    assert_matches_duckdb(duck, expr, sql)
 
 
 @pytest.mark.parametrize(
@@ -257,3 +199,66 @@ def test_parse_sql_unsupported(sql, message):
     """SQL `parse_sql` cannot translate raises instead of dropping a clause."""
     with pytest.raises(com.UnsupportedOperationError, match=message):
         ibis.parse_sql(sql, CATALOG, dialect="duckdb")
+
+
+def test_comparator_checks_row_order(duck):
+    sql, sort_keys = expose_sort_keys("SELECT a, b FROM t ORDER BY a", "duckdb")
+    expected = duck.execute(sql).df()
+    assert list(expected.columns) == ["a", "b", "_sort_key_0"]
+    rows = expected[["a", "b"]]
+    # the two rows with a = 2 tie on the key and may come in either order
+    assert_same_result(rows.iloc[[0, 2, 1, 3]], expected, sort_keys=sort_keys)
+    with pytest.raises(AssertionError, match="differs at row 0"):
+        assert_same_result(rows.iloc[::-1], expected, sort_keys=sort_keys)
+    # without a top-level ORDER BY the rows are a multiset
+    assert_same_result(rows.iloc[::-1], rows)
+
+
+@pytest.mark.parametrize(
+    ("sql", "ascending"),
+    [
+        ("SELECT a, b FROM t ORDER BY 2 DESC, 1", False),
+        ("SELECT a + 1 AS x, b FROM t ORDER BY x DESC", False),
+        # the output column named a, not the source column
+        ("SELECT b AS a, a AS b FROM t ORDER BY a", True),
+        ("SELECT * FROM t ORDER BY 2 DESC, c", False),
+        ("SELECT a FROM t GROUP BY a ORDER BY SUM(c) DESC", False),
+        ("SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY 1 DESC", False),
+    ],
+)
+def test_comparator_resolves_sort_keys(duck, sql, ascending):
+    ordered_sql, sort_keys = expose_sort_keys(sql, "duckdb")
+    expected = duck.execute(ordered_sql).df()
+    key = expected.iloc[:, sort_keys[0]].dropna()
+    assert key.is_monotonic_increasing if ascending else key.is_monotonic_decreasing
+    result = duck.execute(sql).df()
+    assert_same_result(result, expected, sort_keys=sort_keys)
+    with pytest.raises(AssertionError, match="differs"):
+        assert_same_result(result.iloc[::-1], expected, sort_keys=sort_keys)
+
+
+def test_comparator_checks_column_names(duck):
+    expected = duck.execute("SELECT a AS x, COUNT(*) FROM t GROUP BY a").df()
+    assert list(expected.columns) == ["x", "count_star()"]
+    # case does not count, and an unaliased expression is named by the engine
+    assert_same_result(expected.set_axis(["X", "_col_1"], axis=1), expected)
+    with pytest.raises(AssertionError, match="column names differ"):
+        assert_same_result(expected.set_axis(["y", "_col_1"], axis=1), expected)
+
+
+def test_comparator_checks_value_kinds(duck):
+    expected = duck.execute("SELECT a FROM t").df()
+    with pytest.raises(AssertionError, match="holds string values"):
+        assert_same_result(expected.astype(str), expected)
+
+
+def test_comparator_admits_narrow_decimals(duck):
+    expected = duck.execute("SELECT AVG(c) AS m FROM t").df()
+    assert expected["m"].iloc[0] == pytest.approx(2.6666666)
+    rounded = pd.DataFrame({"m": [decimal.Decimal("2.67")]})
+    with pytest.raises(AssertionError, match="narrower decimal scale"):
+        assert_same_result(rounded, expected)
+    assert_same_result(rounded, expected, narrow_decimals=True)
+    exact = pd.DataFrame({"m": [decimal.Decimal(str(expected["m"].iloc[0]))]})
+    with pytest.raises(AssertionError, match="drop `narrow_decimals`"):
+        assert_same_result(exact, expected, narrow_decimals=True)
