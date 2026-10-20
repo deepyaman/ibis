@@ -24,6 +24,7 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.sql.datatypes import SqlglotType
 from ibis.common.annotations import ValidationError
+from ibis.common.deferred import Deferred
 from ibis.util import experimental
 
 # The optimizer rules run before conversion. ``qualify`` resolves every column
@@ -821,8 +822,9 @@ def convert(node, scope):
         return scope.rel[name]
     try:
         return _convert(node, scope)
-    except (TypeError, ValidationError) as e:
-        # Ibis rejected the operands; say which SQL they came from
+    except (TypeError, ValidationError, AttributeError) as e:
+        # Ibis rejected the operands, or a rule called a method the operand's
+        # type lacks (``LENGTH(NULL)``); say which SQL they came from
         raise _invalid(node, scope, f"Cannot translate ({e})") from e
 
 
@@ -1264,7 +1266,14 @@ def convert_window(window, scope):
             # current row (and its peers); Ibis's default is the whole partition
             kwargs["range"] = (None, 0)
 
-    return func.over(ibis.window(group_by=group_by, order_by=order_by, **kwargs))
+    result = func.over(ibis.window(group_by=group_by, order_by=order_by, **kwargs))
+    if isinstance(result, Deferred):
+        # neither the function nor the window names a table (``ROW_NUMBER()
+        # OVER ()``): the window is over the relation of this SELECT
+        if scope.rel is None:
+            raise _unsupported(window, scope, "A window function without a FROM")
+        result = result.resolve(scope.rel)
+    return result
 
 
 _truncation_units = {
@@ -1407,7 +1416,8 @@ def convert_if(func, scope):
 @_convert.register(sge.Count)
 def convert_count(count, scope):
     this = count.this
-    if this is None or isinstance(this, sge.Star):
+    if this is None or isinstance(this, (sge.Star, sge.Literal, sge.Boolean)):
+        # ``COUNT(1)`` counts rows like ``COUNT(*)``
         return scope.rel.count() if scope.rel is not None else ibis._.count()
     if isinstance(this, sge.Distinct):
         if len(this.expressions) != 1:
@@ -1604,11 +1614,16 @@ def _unit(node, units, parent, scope):
 def convert_date_add(func, scope):
     this = convert(func.this, scope=scope)
     unit = func.args.get("unit")
-    unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
     if isinstance(func.expression, sge.Literal):
+        unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
         interval = ibis.interval(int(func.expression.name), unit)
     else:
-        interval = convert(func.expression, scope=scope).as_interval(unit)
+        # the argument may be an interval already (``DATE_ADD(d, INTERVAL 1
+        # DAY)``) or a number of ``unit``
+        interval = convert(func.expression, scope=scope)
+        if not interval.type().is_interval():
+            unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
+            interval = interval.as_interval(unit)
     return this - interval if isinstance(func, sge.DateSub) else this + interval
 
 
