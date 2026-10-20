@@ -929,7 +929,9 @@ _binary_operations = {
     sge.Sub: operator.sub,
     sge.Mul: operator.mul,
     sge.Div: operator.truediv,
-    sge.IntDiv: operator.floordiv,
+    # SQL's integer division truncates toward zero where Ibis's ``//`` floors;
+    # taking the remainder out first makes the quotient exact for both
+    sge.IntDiv: lambda left, right: (left - left % right) // right,
     sge.Mod: operator.mod,
     sge.Pow: operator.pow,
     sge.And: operator.and_,

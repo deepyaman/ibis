@@ -145,7 +145,7 @@ CASES = {
     "string_agg": "SELECT STRING_AGG(b, ',' ORDER BY a, b) AS s FROM t",
     "string_agg_group": "SELECT a, STRING_AGG(b, '|' ORDER BY b) AS s, STRING_AGG(b ORDER BY b) AS t FROM t GROUP BY a",
     "bool_or_and": "SELECT BOOL_OR(a > 1) AS any_big, BOOL_AND(a > 1) AS all_big FROM t",
-    "int_div": "SELECT a // 2 AS h, a % 2 AS m FROM t",
+    "int_div": "SELECT a // 2 AS h, a % 2 AS m, -a // 2 AS nh, -a % 2 AS nm, a // -2 AS hn FROM t",
     "date_diff": "SELECT DATE_DIFF('day', d, DATE '2024-06-01') AS days, DATE_DIFF('month', d, DATE '2024-06-01') AS months, DATE_DIFF('hour', ts, TIMESTAMP '2024-06-01 00:00:00') AS hours FROM t",
     "current_date": "SELECT a FROM t WHERE d < CURRENT_DATE AND ts < CURRENT_TIMESTAMP AND ts < NOW() AND d < TODAY()",
     "exp_log": "SELECT EXP(c) AS e, LOG(c) AS l10, LOG(2, c) AS l2, LN(c) AS l FROM t",
