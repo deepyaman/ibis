@@ -94,7 +94,7 @@ f = joinchain.filter(
     (joinchain.l_shipdate > cast),
 )
 agg = f.aggregate(
-    [(f.l_extendedprice * ((1 - f.l_discount))).sum().name("revenue")],
+    [(f.l_extendedprice * ((ibis.literal(1) - f.l_discount))).sum().name("revenue")],
     by=[f.l_orderkey, f.o_orderdate, f.o_shippriority],
 )
 p = agg.select(agg.l_orderkey, agg.revenue, agg.o_orderdate, agg.o_shippriority)

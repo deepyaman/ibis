@@ -38,13 +38,15 @@ two = ibis.literal(2)
 three = one + two
 nine = three**2
 
-nine_ = (two + one) ** 2
-
 total = t.a.sum()
 roundtrip_cases = {
     "logical_operators": t.filter(((t.a > 1) & ~(t.b == "x")) | (t.a < -t.a)),
     "isin_values": t.filter(t.a.isin([1, 2])),
     "typed_literal": t.select(ibis.literal(1, "int8").name("x")),
+    "typed_literal_operand": t.select(
+        (ibis.literal("0.2", "decimal(2, 1)") * t.a).name("x")
+    ),
+    "literal_only_operands": t.select(((ibis.literal(1) + 2) == 3).name("eq")),
     "interval_literal": ibis.interval(1, "D"),
     "exists": t.filter((u.a == t.a).any()),
     "not_exists": t.filter(~((u.a == t.a) & (u.c > 1)).any()),
@@ -85,8 +87,8 @@ def test_decompile_invalid_type():
         (overall_population_density, overall_population_density),
         (population_density_per_country, population_density_per_country),
         (eurasian_countries, eurasian_countries),
-        (three, 3),
-        (nine, nine_),
+        (three, three),
+        (nine, nine),
     ],
     ids=[
         "top_with_highest_population",

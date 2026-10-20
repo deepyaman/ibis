@@ -451,12 +451,13 @@ def literal(op, value, dtype):
     elif isinstance(op.dtype, dt.Interval):
         return f"ibis.interval({value!r}, {op.dtype.unit.value!r})"
     elif isinstance(op.dtype, dt.Decimal):
-        return CallStatement("ibis.literal", f"{str(value)!r}, {str(dtype)!r}")
+        return f"ibis.literal({str(value)!r}, {str(dtype)!r})"
     elif inferred.type() != op.dtype:
-        return CallStatement("ibis.literal", f"{value!r}, {str(dtype)!r}")
+        return f"ibis.literal({value!r}, {str(dtype)!r})"
     else:
-        # prefer plain python literal values if the inferred datatype is the same,
-        # though this makes rendering method calls on literals more complicated
+        # prefer plain python literal values if the inferred datatype is the
+        # same; a ``CallStatement`` is what the operand and argument rules
+        # unwrap to the plain value
         return CallStatement("ibis.literal", repr(value))
 
 
@@ -525,6 +526,11 @@ _infix_ops = {
 @translate.register(ops.Binary)
 def binary(op, left, right):
     operator = _infix_ops[type(op)]
+    if isinstance(left, CallStatement):
+        # a plain Python value on the left would fold with a plain right
+        # operand, or swap places with an ibis one through the reflected
+        # operator; keep it an ibis expression
+        left = str(left)
     left = _maybe_add_parens(op.left, left)
     right = _maybe_add_parens(op.right, right)
     return _maybe_add_parens(op, f"{left} {operator} {right}")
