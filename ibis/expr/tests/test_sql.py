@@ -5,6 +5,7 @@ import pytest
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.operations as ops
+import ibis.expr.types as ir
 
 pytest.importorskip("black")
 
@@ -468,3 +469,18 @@ def test_scalar_max_of_two_arguments_is_rejected():
     # SQLite's MAX of two arguments is the greater of them, not an aggregate
     with pytest.raises(com.UnsupportedOperationError, match="MAX"):
         ibis.parse_sql("SELECT MAX(a, c) AS m FROM t", tables, dialect="sqlite")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT t.*, u.x FROM t JOIN u ON t.a = u.a",
+        "SELECT t.a, t.b FROM t SEMI JOIN u ON t.a = u.a",
+    ],
+)
+def test_parse_sql_join_identity_is_table(sql):
+    """A SELECT list that is the join's output gives a table, not a join."""
+    catalog = {"t": {"a": "int64", "b": "string"}, "u": {"a": "int64", "x": "string"}}
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
+    assert not isinstance(expr, ir.Join)
+    assert isinstance(expr, ir.Table)

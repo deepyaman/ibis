@@ -584,7 +584,8 @@ def _is_identity(values, rel) -> bool:
 
 def _project(rel, values, elide=True):
     if elide and _is_identity(values, rel):
-        return rel
+        # a join's own ``select`` skips the rewrites of ``Table.select``
+        return _finish(rel)
     if isinstance(rel, ir.Join) and all(_is_plain(value) for value in values):
         # a plain projection of the join's members is the join's own output
         return rel.select(values)
