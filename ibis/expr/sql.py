@@ -1043,12 +1043,16 @@ def convert_binary(binary, scope):
 def convert_is(is_, scope):
     this = convert(is_.this, scope=scope)
     if isinstance(is_.expression, sge.Null):
-        return this.isnull()
-    if isinstance(is_.expression, sge.Boolean):
+        result = this.isnull()
+    elif isinstance(is_.expression, sge.Boolean):
         # ``IS TRUE`` and ``IS FALSE`` are false for NULL where ``=`` would be
         # NULL; ``IS NOT TRUE`` is the ``Not`` of ``IS TRUE`` and follows
-        return (this if is_.expression.this else ~this).fill_null(False)
-    raise _unsupported(is_, scope)
+        result = (this if is_.expression.this else ~this).fill_null(False)
+    else:
+        raise _unsupported(is_, scope)
+    # sqlglot parses ``x IS NOT y`` as ``Is(negate=True)`` for some dialects
+    # from 30.14 and as ``Not(Is)`` otherwise
+    return ~result if is_.args.get("negate") else result
 
 
 def _convert_like(like, scope, method):

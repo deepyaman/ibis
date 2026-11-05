@@ -280,3 +280,15 @@ def test_concat_null_handling_follows_the_dialect():
 def test_from_less_select_keeps_its_order_by():
     expr = ibis.parse_sql("SELECT 2 AS two, 1 AS one ORDER BY one", tables)
     assert isinstance(expr.op(), ops.Sort)
+
+
+@pytest.mark.parametrize(
+    "condition", ["b IS NOT NULL", "b NOTNULL", "(a > 1) IS NOT TRUE"]
+)
+def test_negated_is_follows_the_dialect(condition):
+    # sqlglot parses ``IS NOT`` as ``Is(negate=True)`` for postgres from 30.14
+    # and as ``Not(Is)`` for duckdb
+    sql = f"SELECT a FROM t WHERE {condition}"
+    expected = ibis.parse_sql(sql.replace("NOTNULL", "IS NOT NULL"), tables)
+    result = ibis.parse_sql(sql, tables, dialect="postgres")
+    assert ibis.to_sql(result) == ibis.to_sql(expected)
