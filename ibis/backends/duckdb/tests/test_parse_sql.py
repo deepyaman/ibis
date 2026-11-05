@@ -229,6 +229,7 @@ CASES = {
     "grouped_filtered_metric_also_windowed": "SELECT a, COUNT(*) AS n, COUNT(*) FILTER (WHERE a > 1) OVER () AS total FROM t GROUP BY a",
     "grouped_named_window_aggregate_partition": "SELECT a, COUNT(*) OVER w AS n FROM t GROUP BY a WINDOW w AS (PARTITION BY SUM(c) > 2)",
     "grouped_named_window_aggregate_order": "SELECT a, ROW_NUMBER() OVER w AS r FROM t GROUP BY a WINDOW w AS (ORDER BY COUNT(*), a)",
+    "order_by_filtered_aggregate_alias_column": "SELECT a, COUNT(*) AS n FROM t GROUP BY a ORDER BY SUM(c) FILTER (WHERE a > 1) DESC, a",
 }
 
 UNSUPPORTED = {

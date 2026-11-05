@@ -166,6 +166,20 @@ class Scope:
         if not alias:
             if self.outputs is not None and name in self.outputs:
                 return self.outputs[name]
+            if self.outputs is None:
+                # ``qualify`` leaves a column unqualified when it names a
+                # SELECT alias, even inside the FILTER of an ORDER BY
+                # aggregate, which is computed before the SELECT list exists
+                # and so reads the FROM clause's column
+                owners = [
+                    owner
+                    for owner, member in self.members.items()
+                    if name in member.columns
+                ]
+                if len(owners) > 1:
+                    raise com.IbisInputError(f"Column {name!r} is ambiguous")
+                if owners:
+                    return self.column(owners[0], name)
             raise com.IbisInputError(f"Cannot resolve column {name!r}")
         if (member := self.members.get(alias)) is not None:
             if self.agg is not None:
