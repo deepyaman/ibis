@@ -224,6 +224,9 @@ CASES = {
     "window_fractional_bound": "SELECT a, SUM(c) OVER (ORDER BY c RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM t",
     "named_window_chain": "SELECT a, b, SUM(c) OVER w2 AS s FROM t WINDOW w1 AS (PARTITION BY b), w2 AS (w1 ORDER BY a)",
     "named_window_chain_row_number": "SELECT a, c, ROW_NUMBER() OVER w2 AS r FROM t WINDOW w1 AS (PARTITION BY a), w2 AS (w1 ORDER BY c)",
+    "grouped_metric_also_windowed": "SELECT a, COUNT(*) AS n, COUNT(*) OVER () AS total FROM t GROUP BY a",
+    "grouped_metric_also_windowed_partitioned": "SELECT a, SUM(c) AS s, SUM(c) OVER (PARTITION BY a) AS w FROM t GROUP BY a, c",
+    "grouped_filtered_metric_also_windowed": "SELECT a, COUNT(*) AS n, COUNT(*) FILTER (WHERE a > 1) OVER () AS total FROM t GROUP BY a",
 }
 
 UNSUPPORTED = {

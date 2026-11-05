@@ -876,7 +876,14 @@ def _convert(node, scope):
 
 def convert(node, scope):
     """Convert a value expression against ``scope``."""
-    if scope.agg is not None and (name := scope.agg.memo.get(node)) is not None:
+    if (
+        scope.agg is not None
+        # a window's function is computed over the aggregate, not by it
+        and isinstance(node, sge.Expression)
+        and not _is_window_function(node)
+        and not (isinstance(node.parent, sge.Window) and node.parent.this is node)
+        and (name := scope.agg.memo.get(node)) is not None
+    ):
         # an aggregate or GROUP BY expression computed by the aggregate
         return scope.rel[name]
     try:
