@@ -165,7 +165,12 @@ class Scope:
     def column(self, alias: str, name: str) -> ir.Value:
         if not alias:
             if self.outputs is not None and name in self.outputs:
-                return self.outputs[name]
+                if (value := self.outputs[name]) is None:
+                    raise com.IbisInputError(
+                        f"Column {name!r} is ambiguous: more than one SELECT "
+                        "item has that name"
+                    )
+                return value
             raise com.IbisInputError(f"Cannot resolve column {name!r}")
         if (member := self.members.get(alias)) is not None:
             if self.agg is not None:
@@ -599,10 +604,17 @@ def _input_key(key, scope):
     return key
 
 
-def _order_by(order, scope, proj, values, distinct):
-    scope.outputs = _keyed(
-        {value.get_name(): value for value in values}, scope.root.dialect
-    )
+def _order_by(order, scope, proj, values, distinct, names=None):
+    """Sort ``proj``; ``names`` are the SELECT list's names as the SQL wrote them."""
+    if names is None:
+        names = [value.get_name() for value in values]
+    counts = collections.Counter(_normalize(name, scope.root.dialect) for name in names)
+    outputs = {}
+    for name, value in zip(names, values):
+        # a name more than one item has is ambiguous to refer to
+        ambiguous = counts[_normalize(name, scope.root.dialect)] > 1
+        outputs[name] = None if ambiguous else value
+    scope.outputs = _keyed(outputs, scope.root.dialect)
     keys = [convert(_input_key(key, scope), scope) for key in order.expressions]
     try:
         return proj.order_by(keys)
@@ -785,7 +797,9 @@ def convert_select(select, scope, *, projection=True, elide=True):
     if distinct:
         rel = rel.distinct()
     if order is not None:
-        rel = _order_by(order, scope, rel, values, distinct)
+        rel = _order_by(
+            order, scope, rel, values, distinct, names=[name for _, name in items]
+        )
     return _limit(select, rel, scope)
 
 

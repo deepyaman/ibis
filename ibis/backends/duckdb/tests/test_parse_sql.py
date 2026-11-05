@@ -369,6 +369,14 @@ INVALID = {
     "syntax_error": ("SELEC a FROM t", "Cannot parse"),
     "two_statements": ("SELECT a FROM t; SELECT a FROM u", "one statement"),
     "empty": ("", "one statement"),
+    "order_by_duplicated_alias": (
+        "SELECT a AS k, b AS k FROM t ORDER BY k",
+        "(?i)ambiguous",
+    ),
+    "order_by_duplicated_alias_reversed": (
+        "SELECT b AS k, a AS k FROM t ORDER BY k",
+        "(?i)ambiguous",
+    ),
     "order_by_expression_of_ungrouped_column": (
         "SELECT a % 2 AS a, COUNT(*) AS n FROM t GROUP BY 1 ORDER BY a + 1 DESC, n",
         "GROUP BY",
