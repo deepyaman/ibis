@@ -1271,6 +1271,10 @@ def convert_window(window, scope):
         else:
             end = _window_bound(end, spec.args.get("end_side"))
         kind = (spec.args.get("kind") or "ROWS").upper()
+        if kind not in ("ROWS", "RANGE"):
+            # Ibis's frames count rows or range over values; a GROUPS frame
+            # counts peer groups
+            raise _unsupported(window, scope, f"A {kind} window frame")
         kwargs["rows" if kind == "ROWS" else "range"] = (start, end)
     else:
         # a FILTER wraps the aggregate the window applies to

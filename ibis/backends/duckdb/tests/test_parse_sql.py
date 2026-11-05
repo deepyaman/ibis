@@ -242,6 +242,10 @@ UNSUPPORTED = {
         "SELECT SUM(c) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t",
         "EXCLUDE",
     ),
+    "window_groups": (
+        "SELECT SUM(c) OVER (ORDER BY c GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "GROUPS",
+    ),
     "count_distinct_two": ("SELECT COUNT(DISTINCT a, b) FROM t", "COUNT"),
     "between_symmetric": (
         "SELECT a FROM t WHERE a BETWEEN SYMMETRIC 2 AND 1",
@@ -343,6 +347,11 @@ OLD_SQLGLOT = {
 OLD_SQLGLOT["limit_percent"] = pytest.mark.skipif(
     vparse(sqlglot.__version__) < vparse("28"),
     reason="sqlglot rejects LIMIT n% as syntax before 28.0",
+)
+
+OLD_SQLGLOT["window_groups"] = pytest.mark.skipif(
+    vparse(sqlglot.__version__) < vparse("30"),
+    reason="sqlglot rejects a GROUPS frame as syntax before 30.0",
 )
 
 # the SQL Ibis compiles these to returns a different result, for the reason given
