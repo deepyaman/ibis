@@ -785,7 +785,8 @@ def convert_select(select, scope, *, projection=True, elide=True):
         _anchor(scope, [having.this])
         scope.rebind(scope.rel.filter(_boolean(having.this, scope)))
     if not projection:
-        return scope.rel
+        # ``EXISTS (... LIMIT 0)`` is false: the rows' count still matters
+        return _limit(select, scope.rel, scope)
 
     _anchor(scope, [expression for expression, _ in items])
     values = _unique_names(

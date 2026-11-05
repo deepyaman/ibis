@@ -229,6 +229,8 @@ CASES = {
     "paren_union_intersect": "(SELECT a FROM t UNION SELECT a FROM u) INTERSECT SELECT a FROM u",
     "order_by_expression_of_shadowed_column": "SELECT -a AS a FROM t ORDER BY a + 1",
     "order_by_shadowing_alias": "SELECT -a AS a FROM t ORDER BY a",
+    "exists_limit_zero": "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t.a LIMIT 0)",
+    "not_exists_offset_past_end": "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM u OFFSET 5)",
 }
 
 UNSUPPORTED = {
