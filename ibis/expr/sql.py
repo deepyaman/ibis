@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import itertools
 import operator
 import re
 from dataclasses import dataclass, field
@@ -339,7 +340,8 @@ def _map_member(member, right, rel, dialect) -> None:
     """Address the columns of a joined table through the join chain's output."""
     columns = {}
     source = right.op()
-    for name, value in rel.op().values.items():
+    values = rel.op().values
+    for name, value in values.items():
         # a member is wrapped in a ``JoinReference`` unless it is a reference
         # already (a ``.view()``)
         if isinstance(value, ops.Field) and (
@@ -347,10 +349,17 @@ def _map_member(member, right, rel, dialect) -> None:
             or (isinstance(value.rel, ops.JoinReference) and value.rel.parent == source)
         ):
             columns[value.name] = name
+    # an inner join key is not repeated in the output when it is equal to
+    # the same-named column of the left side: it is that column
+    ref = rel.op().rest[-1].table
     for name in right.columns:
-        # an inner join key is not repeated in the output when it is equal to
-        # the same-named column of the left side: it is that column
-        columns.setdefault(name, name)
+        if name not in columns and name in values:
+            try:
+                equal = rel._equalities.connected(values[name], ref.fields[name])
+            except KeyError:
+                equal = False
+            if equal:
+                columns[name] = name
     member.columns = _keyed(columns, dialect)
 
 
@@ -405,13 +414,20 @@ def _build_from(select, scope):
         deferred.extend(late)
         _reject_aggregates(on, scope, "a join condition")
         predicates = [_boolean(condition, scope) for condition in local]
-        rname = "{name}_" + alias
-        if predicates:
-            rel = rel.join(right, predicates, how=how, rname=rname)
-        elif how == "inner":
-            rel = rel.cross_join(right, rname=rname)
-        else:
-            rel = rel.join(right, how=how, rname=rname)
+        left = rel
+        for n in itertools.count():
+            # a right column renamed after its alias must not take the name of
+            # a column already in the chain (``id`` of ``cliente`` and
+            # ``id_cliente``)
+            rname = "{name}_" + alias + (f"_{n}" if n else "")
+            if predicates:
+                rel = left.join(right, predicates, how=how, rname=rname)
+            elif how == "inner":
+                rel = left.cross_join(right, rname=rname)
+            else:
+                rel = left.join(right, how=how, rname=rname)
+            if not rel._collisions:
+                break
         _map_member(scope.members[alias], right, rel, scope.root.dialect)
         scope.rebind(rel)
         bound = visible

@@ -641,3 +641,41 @@ def test_comparator_compares_nested_values(duck):
     shifted = duck.execute(sql.replace("(a) DAY", "(a + 1) DAY")).fetch_arrow_table()
     with pytest.raises(AssertionError, match="column 'iv' differs"):
         assert_same_result(shifted, expected)
+
+
+FK_CATALOG = {
+    "pedidos": {"id": "int64", "id_cliente": "int64", "total": "float64"},
+    "cliente": {"id": "int64", "nombre": "string"},
+}
+
+
+@pytest.fixture(scope="module")
+def fk_duck():
+    con = duckdb.connect()
+    con.execute("CREATE TABLE pedidos (id BIGINT, id_cliente BIGINT, total DOUBLE)")
+    con.execute("INSERT INTO pedidos VALUES (1, 10, 5.0), (3, 20, 7.0)")
+    con.execute("CREATE TABLE cliente (id BIGINT, nombre VARCHAR)")
+    con.execute("INSERT INTO cliente VALUES (10, 'ana'), (20, 'bo')")
+    return con
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "SELECT pedidos.id, cliente.nombre FROM pedidos "
+            "JOIN cliente ON pedidos.id_cliente = cliente.id",
+            id="renamed_right_column_collides",
+        ),
+        pytest.param(
+            "SELECT p.id, (SELECT cliente.id FROM pedidos AS p2 LEFT JOIN cliente "
+            "ON p2.id_cliente = cliente.id ORDER BY cliente.id DESC NULLS LAST "
+            "LIMIT 1) AS s FROM pedidos p",
+            id="renamed_right_column_collides_in_subquery",
+        ),
+    ],
+)
+def test_parse_sql_join_rename_avoids_collisions(fk_duck, sql):
+    """A right column renamed after its alias does not take an existing name."""
+    expr = ibis.parse_sql(sql, FK_CATALOG, dialect="duckdb")
+    assert_matches_duckdb(fk_duck, expr, sql)
