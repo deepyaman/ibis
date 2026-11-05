@@ -290,6 +290,12 @@ UNSUPPORTED = {
     "bitwise_and": ("SELECT a & 1 FROM t", "(?i)bitwise"),
     "parameter": ("SELECT a FROM t WHERE b = $1", "(?i)placeholder"),
     "insert": ("INSERT INTO t VALUES (1)", "(?i)insert"),
+    "from_less_count_star": ("SELECT COUNT(*)", "without a FROM"),
+    "from_less_count_alias": ("SELECT COUNT(*) AS n", "without a FROM"),
+    "from_less_count_one": ("SELECT COUNT(1) AS n", "without a FROM"),
+    "from_less_count_plus_one": ("SELECT COUNT(1) + 1 AS n", "without a FROM"),
+    "from_less_sum": ("SELECT SUM(1) AS n", "without a FROM"),
+    "from_less_max": ("SELECT MAX(1) AS n", "without a FROM"),
 }
 
 # SQL that is invalid, or that Ibis cannot type, raises an input error

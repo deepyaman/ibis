@@ -769,6 +769,13 @@ def _output_name(item, scope):
 
 def _convert_from_less(select, scope):
     # ``SELECT 1 AS x`` has no FROM clause
+    roots = [
+        item.this if isinstance(item, sge.Alias) else item
+        for item in select.expressions
+    ]
+    if units := _metric_units(roots, scope):
+        # Ibis aggregates a table; there is none to aggregate
+        raise _unsupported(units[0], scope, "An aggregate function without a FROM")
     values = {}
     for item in select.expressions:
         expression = item.this if isinstance(item, sge.Alias) else item
@@ -1486,7 +1493,9 @@ def convert_count(count, scope):
     this = count.this
     if this is None or isinstance(this, (sge.Star, sge.Literal, sge.Boolean)):
         # ``COUNT(1)`` counts rows like ``COUNT(*)``
-        return scope.rel.count() if scope.rel is not None else ibis._.count()
+        if scope.rel is None:
+            raise _unsupported(count, scope, "An aggregate function without a FROM")
+        return scope.rel.count()
     if isinstance(this, sge.Distinct):
         if len(this.expressions) != 1:
             raise _unsupported(count, scope, "COUNT(DISTINCT) of several expressions")
