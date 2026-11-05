@@ -292,3 +292,14 @@ def test_negated_is_follows_the_dialect(condition):
     expected = ibis.parse_sql(sql.replace("NOTNULL", "IS NOT NULL"), tables)
     result = ibis.parse_sql(sql, tables, dialect="postgres")
     assert ibis.to_sql(result) == ibis.to_sql(expected)
+
+
+@pytest.mark.parametrize("kind", ["SEMI", "ANTI"])
+def test_right_semi_and_anti_joins_are_rejected(kind):
+    # a ClickHouse RIGHT SEMI join keeps the rows of the right table, not the left
+    sql = f"SELECT t.a FROM t RIGHT {kind} JOIN u ON t.a = u.a"
+    with pytest.raises(com.UnsupportedOperationError, match=kind):
+        ibis.parse_sql(sql, tables, dialect="clickhouse")
+    # LEFT is the side of a semi or anti join that Ibis has
+    left = ibis.parse_sql(sql.replace("RIGHT", "LEFT"), tables, dialect="clickhouse")
+    assert left.columns == ("a",)
