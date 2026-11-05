@@ -336,7 +336,7 @@ def _hoistable(condition, visible, alias) -> bool:
     )
 
 
-def _map_member(member, right, rel, dialect) -> None:
+def _map_member(member, right, rel, how, dialect) -> None:
     """Address the columns of a joined table through the join chain's output."""
     columns = {}
     source = right.op()
@@ -350,9 +350,10 @@ def _map_member(member, right, rel, dialect) -> None:
         ):
             columns[value.name] = name
     # an inner join key is not repeated in the output when it is equal to
-    # the same-named column of the left side: it is that column
+    # the same-named column of the left side: it is that column; a semi or
+    # anti join discards the right side's columns
     ref = rel.op().rest[-1].table
-    for name in right.columns:
+    for name in right.columns if how == "inner" else ():
         if name not in columns and name in values:
             try:
                 equal = rel._equalities.connected(values[name], ref.fields[name])
@@ -428,7 +429,7 @@ def _build_from(select, scope):
                 rel = left.join(right, how=how, rname=rname)
             if not rel._collisions:
                 break
-        _map_member(scope.members[alias], right, rel, scope.root.dialect)
+        _map_member(scope.members[alias], right, rel, how, scope.root.dialect)
         scope.rebind(rel)
         bound = visible
     return rel, deferred + where

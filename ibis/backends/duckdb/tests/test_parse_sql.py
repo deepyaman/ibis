@@ -297,6 +297,14 @@ INVALID = {
     "unknown_column": ("SELECT zzz FROM t", "zzz"),
     "unknown_table": ("SELECT a FROM nope", "nope"),
     "ambiguous_column": ("SELECT a FROM t JOIN u ON t.a = u.a", "'a'"),
+    "anti_join_right_column": (
+        "SELECT t.a, u.a AS ua FROM t ANTI JOIN u ON t.a = u.a",
+        "'u'",
+    ),
+    "semi_join_right_column_in_where": (
+        "SELECT t.a FROM t SEMI JOIN u ON t.a < u.a WHERE u.a = 3",
+        "'u'",
+    ),
     "duplicate_alias": ("SELECT * FROM t AS x, u AS x", "x"),
     "duplicate_cte": (
         "WITH x AS (SELECT 1 AS a), x AS (SELECT 2 AS a) SELECT a FROM x",
