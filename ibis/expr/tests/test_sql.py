@@ -437,3 +437,28 @@ def test_right_semi_and_anti_joins_are_rejected(kind):
     # LEFT is the side of a semi or anti join that Ibis has
     left = ibis.parse_sql(sql.replace("RIGHT", "LEFT"), tables, dialect="clickhouse")
     assert left.columns == ("a",)
+
+
+def test_typed_division_of_integers_is_integer_division():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t AS SELECT * FROM (VALUES (7, 7.0), (-7, -7.0)) v(a, c)")
+    # Postgres's ``/`` divides integers to an integer truncated toward zero
+    sql = "SELECT a / 2 AS h, 7 / 2 AS k, c / 2 AS f FROM t"
+    expr = ibis.parse_sql(sql, tables, dialect="postgres")
+    assert expr.schema()["h"].is_integer()
+    assert expr.schema()["k"].is_integer()
+    assert expr.schema()["f"].is_floating()
+    result = con.execute(ibis.to_sql(expr, dialect="duckdb")).fetchall()
+    assert sorted(result) == [(-3, 3, -3.5), (3, 3, 3.5)]
+    # DuckDB's ``/`` is true division
+    expr = ibis.parse_sql(sql, tables, dialect="duckdb")
+    assert expr.schema()["h"].is_floating()
+
+
+def test_round_with_truncation_is_rejected():
+    with pytest.raises(com.UnsupportedOperationError, match="ROUND"):
+        ibis.parse_sql("SELECT ROUND(c, 1, 1) AS r FROM t", tables, dialect="tsql")
+    # a zero third argument rounds
+    expr = ibis.parse_sql("SELECT ROUND(c, 1, 0) AS r FROM t", tables, dialect="tsql")
+    assert isinstance(expr.op().values["r"], ops.Round)
