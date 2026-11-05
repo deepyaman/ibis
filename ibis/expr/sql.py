@@ -371,6 +371,8 @@ def _build_from(select, scope):
             or join.args.get("match_condition")
             or join.side not in _JOIN_SIDES
             or join.kind not in _JOIN_KINDS
+            # Ibis's semi and anti joins keep the left table's rows only
+            or (_JOIN_KINDS[join.kind] and join.side not in ("", "LEFT"))
         ):
             raise _unsupported(join, scope, "This kind of join")
         how = _JOIN_KINDS[join.kind] or _JOIN_SIDES[join.side]
