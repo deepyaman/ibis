@@ -731,7 +731,7 @@ class SQLGlotCompiler(abc.ABC):
         return self.cast(arg, to)
 
     def visit_ScalarSubquery(self, op, *, rel):
-        return rel.this.subquery(copy=False)
+        return self._subquery_query(rel).subquery(copy=False)
 
     def visit_Literal(self, op, *, value, dtype):
         """Compile a literal value.
@@ -1144,15 +1144,22 @@ class SQLGlotCompiler(abc.ABC):
 
     visit_SearchedCase = visit_SimpleCase
 
+    @staticmethod
+    def _subquery_query(rel):
+        """Return the query of a subquery's relation, selecting from bare tables."""
+        query = rel.this
+        if not isinstance(query, sge.Query):
+            # a bare table has no SELECT to put in the subquery; select from
+            # the table itself, because `rel.this` drops its database
+            query = sg.select(STAR).from_(rel)
+        return query
+
     def visit_ExistsSubquery(self, op, *, rel):
-        select = rel.this.select(1, append=False)
+        select = self._subquery_query(rel).select(1, append=False)
         return self.f.exists(select)
 
     def visit_InSubquery(self, op, *, rel, needle):
-        query = rel.this
-        if not isinstance(query, sge.Select):
-            query = sg.select(STAR).from_(query)
-        return needle.isin(query=query)
+        return needle.isin(query=self._subquery_query(rel))
 
     def visit_Array(self, op, *, exprs):
         return self.f.array(*exprs)

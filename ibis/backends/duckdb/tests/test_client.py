@@ -16,6 +16,7 @@ from pytest import param
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
+import ibis.expr.operations as ops
 from ibis.conftest import LINUX, SANDBOXED, not_windows
 from ibis.util import gen_name
 
@@ -518,3 +519,34 @@ def test_basic_enum_schema_inference(con, converter):
     t = con.table(name)
     assert t.e.type() == dt.string
     assert set(converter(t.e)) == {"a", "b"}
+
+
+@pytest.mark.parametrize(
+    ("make_predicate", "sql"),
+    [
+        param(
+            lambda t, one: t.a > one.as_scalar(),
+            "SELECT * FROM t WHERE a > (SELECT a FROM one)",
+            id="scalar",
+        ),
+        param(
+            lambda t, one: t.a > one.view().as_scalar(),
+            "SELECT * FROM t WHERE a > (SELECT a FROM one)",
+            id="scalar_view",
+        ),
+        param(
+            lambda _, one: ops.ExistsSubquery(one).to_expr(),
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM one)",
+            id="exists",
+        ),
+    ],
+)
+def test_subquery_over_bare_table(make_predicate, sql):
+    con = ibis.duckdb.connect()
+    one = con.create_table("one", {"a": [2]})
+    t = con.create_table("t", {"a": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+
+    df = t.filter(make_predicate(t, one)).execute()
+    result = sorted(df.itertuples(index=False, name=None))
+    expected = sorted(con.con.execute(sql).fetchall())
+    assert result == expected

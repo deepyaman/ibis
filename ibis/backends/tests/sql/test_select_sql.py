@@ -4,6 +4,7 @@ import pytest
 from pytest import param
 
 import ibis
+import ibis.expr.operations as ops
 from ibis import _
 from ibis.backends.tests.sql.conftest import to_sql
 from ibis.tests.util import assert_decompile_roundtrip, schemas_eq
@@ -478,6 +479,27 @@ def test_identifier_quoting(snapshot):
 
 def test_scalar_subquery_different_table(foo, bar, snapshot):
     expr = foo.filter(foo.y > bar.x.max())
+    snapshot.assert_match(to_sql(expr), "out.sql")
+
+
+@pytest.mark.parametrize(
+    "make_predicate",
+    [
+        param(lambda t, one: t.a > one.as_scalar(), id="scalar"),
+        param(lambda t, one: t.a > one.view().as_scalar(), id="scalar_view"),
+        param(lambda _, one: ops.ExistsSubquery(one).to_expr(), id="exists"),
+        param(
+            lambda t, _: (
+                t.a > ibis.table({"a": "int64"}, name="one", database="db").as_scalar()
+            ),
+            id="scalar_qualified",
+        ),
+    ],
+)
+def test_subquery_over_bare_table(make_predicate, snapshot):
+    one = ibis.table({"a": "int64"}, name="one")
+    t = ibis.table({"a": "int64", "c": "float64"}, name="t")
+    expr = t.filter(make_predicate(t, one))
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
