@@ -1443,7 +1443,10 @@ def convert_trim(func, scope):
 
 @_convert.register(sge.Initcap)
 def convert_initcap(func, scope):
-    return convert(func.this, scope=scope).capitalize()
+    # INITCAP capitalizes every word, ``capitalize`` only the first letter;
+    # some dialects (duckdb) write INITCAP out as a long expression, so the
+    # message quotes the call as sqlglot's own dialect writes it
+    raise _unsupported(func.sql(), scope, "The function INITCAP")
 
 
 @_convert.register(sge.If)

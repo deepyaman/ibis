@@ -257,6 +257,7 @@ UNSUPPORTED = {
     "extract_decade": ("SELECT EXTRACT(decade FROM d) FROM t", "(?i)decade"),
     "regexp_flags": ("SELECT REGEXP_MATCHES(b, 'A', 'i') FROM t", "(?i)flags"),
     "trim_characters": ("SELECT TRIM('f' FROM b) FROM t", "TRIM"),
+    "initcap": ("SELECT INITCAP(b) FROM t", "INITCAP"),
     "limit_percent": ("SELECT a FROM t LIMIT 10%", "PERCENT"),
     "fetch_with_ties": (
         "SELECT a FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES",
