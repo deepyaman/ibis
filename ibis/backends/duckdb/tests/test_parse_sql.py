@@ -77,6 +77,12 @@ CASES = {
     "decimal_literal_scale": "SELECT SUM(a) * 0.0001000000 AS x, SUM(a) * 100.0000 AS y FROM t",
     "decimal_column_literal_scale": "SELECT CAST(c AS DECIMAL(10, 2)) * 1.00000 AS z, CAST(c AS DECIMAL(10, 2)) + 0.0001 AS w FROM t",
     "decimal_literal_wide_result": "SELECT a * 1000000 * 1.5 AS q, a * 1000000 * 0.1 AS r, a * 1000 + 0.25 AS s FROM t",
+    "float_decimal_literal_branches": "SELECT CASE WHEN a > 1 THEN c / 3 ELSE 0.25 END AS x, CASE a WHEN 1 THEN 0.25 ELSE c / 3 END AS y, IF(a > 1, c / 3, 0.25) AS i, COALESCE(c / 3, 0.25) AS z, GREATEST(c / 3, 0.25) AS g, LEAST(c / 3, 0.25) AS l, NULLIF(c / 3, 0.25) AS n FROM t",
+    "float_decimal_column_branches": "SELECT CASE WHEN a > 1 THEN c / 3 ELSE CAST(a AS DECIMAL(3, 2)) END AS x, CASE a WHEN 1 THEN CAST(a AS DECIMAL(3, 2)) ELSE c / 3 END AS y, IF(a > 1, c / 3, CAST(a AS DECIMAL(3, 2))) AS i, COALESCE(c / 3, CAST(a AS DECIMAL(3, 2))) AS z, GREATEST(c / 3, CAST(a AS DECIMAL(3, 2))) AS g, LEAST(CAST(a AS DECIMAL(3, 2)), c / 3) AS l, NULLIF(c / 3, CAST(a AS DECIMAL(3, 2))) AS n FROM t",
+    "nullif_decimal_float": "SELECT NULLIF(CAST(a AS DECIMAL(3, 2)), c) AS n FROM t",
+    "float_decimal_literal_union": "SELECT c / 3 AS x FROM t UNION ALL SELECT 0.25",
+    "float_decimal_column_union": "SELECT c / 3 AS x FROM t UNION ALL SELECT CAST(a AS DECIMAL(3, 2)) FROM t",
+    "decimal_float_column_union": "SELECT CAST(a AS DECIMAL(3, 2)) AS x FROM t UNION ALL SELECT c / 3 FROM t",
     "arithmetic_alias": "SELECT a * 2 + 1 AS z, c / 2 AS h FROM t",
     "window_row_number": "SELECT a, ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) AS rn FROM t",
     "window_cumulative_sum": "SELECT a, SUM(c) OVER (ORDER BY a) AS cs FROM t",
@@ -359,6 +365,14 @@ MISCOMPILED = {
     "decimal_literal": _FLOAT_LITERALS,
     "decimal_literal_scale": _FLOAT_LITERALS,
     "decimal_column_literal_scale": _FLOAT_LITERALS,
+    "nullif_decimal_float": pytest.mark.xfail(
+        reason=(
+            "NULLIF of a decimal and a float is typed float64, as the float "
+            "wins wherever they meet; DuckDB keeps the first argument's type "
+            "(values agree)"
+        ),
+        strict=True,
+    ),
 }
 
 

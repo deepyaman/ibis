@@ -768,7 +768,7 @@ def _align_set_operands(left, right):
 
     left_values, right_values = [], []
     for name, rname in zip(left.columns, right.columns):
-        lcol, rcol = left[name], right[rname]
+        lcol, rcol = _float_wins([left[name], right[rname]])
         target = highest_precedence([lcol.type(), rcol.type()])
         if lcol.type() != target:
             lcol = lcol.cast(target)
@@ -964,34 +964,38 @@ _NULL_SAFE = (sge.NullSafeEQ, sge.NullSafeNEQ)
 _ARITHMETIC = (sge.Add, sge.Sub, sge.Mul, sge.Div, sge.IntDiv, sge.Mod, sge.Pow)
 
 
-def _align_numeric(left, right):
-    """Give the operands of an arithmetic operator a type Ibis can rank.
+def _float_wins(values):
+    """Give values that meet in one result a type Ibis can rank.
 
     A float and a decimal compute in floating point in SQL engines, where
-    Ibis would type the result decimal and narrow it to that scale on fetch.
+    Ibis would type the result decimal and narrow it to that scale on fetch,
+    so if any value is floating the decimal ones are cast to ``float64``.
     Two decimals rank by precision and scale together, so one narrower in
     precision but wider in scale (``decimal(38, 2) * 0.0001``) has no common
     type until the narrower one is widened to both.
     """
-    ltype, rtype = left.type(), right.type()
-    if ltype.is_floating() and rtype.is_decimal():
-        return left, right.cast(ltype)
-    if rtype.is_floating() and ltype.is_decimal():
-        return left.cast(rtype), right
-    if (
-        ltype.is_decimal()
-        and rtype.is_decimal()
-        and None not in (ltype.precision, ltype.scale, rtype.precision, rtype.scale)
-        and not (ltype.castable(rtype) or rtype.castable(ltype))
-    ):
-        wide = dt.Decimal(
-            min(max(ltype.precision, rtype.precision), 38),
-            max(ltype.scale, rtype.scale),
-        )
-        if ltype.precision < rtype.precision:
-            return left.cast(wide), right
-        return left, right.cast(wide)
-    return left, right
+    types = [value.type() for value in values]
+    if any(t.is_floating() for t in types):
+        return [
+            value.cast(dt.float64) if t.is_decimal() else value
+            for value, t in zip(values, types)
+        ]
+    if len(values) == 2:
+        (left, right), (ltype, rtype) = values, types
+        if (
+            ltype.is_decimal()
+            and rtype.is_decimal()
+            and None not in (ltype.precision, ltype.scale, rtype.precision, rtype.scale)
+            and not (ltype.castable(rtype) or rtype.castable(ltype))
+        ):
+            wide = dt.Decimal(
+                min(max(ltype.precision, rtype.precision), 38),
+                max(ltype.scale, rtype.scale),
+            )
+            if ltype.precision < rtype.precision:
+                return [left.cast(wide), right]
+            return [left, right.cast(wide)]
+    return list(values)
 
 
 def _convert_quantified(binary, scope):
@@ -1027,7 +1031,7 @@ def convert_binary(binary, scope):
         return ibis.null(other.type())
     left, right = convert(left, scope), convert(right, scope)
     if isinstance(binary, _ARITHMETIC):
-        left, right = _align_numeric(left, right)
+        left, right = _float_wins([left, right])
     return op(left, right)
 
 
@@ -1349,16 +1353,14 @@ def convert_log(func, scope):
 @_convert.register(sge.Greatest)
 def convert_greatest(func, scope):
     return ibis.greatest(
-        convert(func.this, scope=scope),
-        *(convert(e, scope=scope) for e in func.expressions),
+        *_float_wins([convert(e, scope=scope) for e in (func.this, *func.expressions)])
     )
 
 
 @_convert.register(sge.Least)
 def convert_least(func, scope):
     return ibis.least(
-        convert(func.this, scope=scope),
-        *(convert(e, scope=scope) for e in func.expressions),
+        *_float_wins([convert(e, scope=scope) for e in (func.this, *func.expressions)])
     )
 
 
@@ -1411,8 +1413,10 @@ def convert_initcap(func, scope):
 def convert_if(func, scope):
     cond = convert(func.this, scope=scope)
     true = convert(func.args["true"], scope=scope)
-    false = func.args.get("false")
-    return cond.ifelse(true, None if false is None else convert(false, scope=scope))
+    if (false := func.args.get("false")) is None:
+        return cond.ifelse(true, None)
+    true, false = _float_wins([true, convert(false, scope=scope)])
+    return cond.ifelse(true, false)
 
 
 @_convert.register(sge.Count)
@@ -1467,6 +1471,12 @@ def convert_case(case, scope):
     ]
     default = case.args.get("default")
     else_ = None if default is None else convert(default, scope=scope)
+    results = _float_wins(
+        [result for _, result in branches] + ([] if else_ is None else [else_])
+    )
+    if else_ is not None:
+        else_ = results.pop()
+    branches = [(cond, result) for (cond, _), result in zip(branches, results)]
     if (base := case.this) is not None:
         return convert(base, scope=scope).cases(*branches, else_=else_)
     return ibis.cases(*branches, else_=else_)
@@ -1639,8 +1649,10 @@ def convert_interval(interval, scope):
 
 @_convert.register(sge.Nullif)
 def convert_nullif(nullif, scope):
-    this = convert(nullif.this, scope=scope)
-    return this.nullif(convert(nullif.expression, scope=scope))
+    this, other = _float_wins(
+        [convert(nullif.this, scope=scope), convert(nullif.expression, scope=scope)]
+    )
+    return this.nullif(other)
 
 
 @_convert.register(sge.Coalesce)
@@ -1648,7 +1660,7 @@ def convert_coalesce(coalesce, scope):
     args = [convert(coalesce.this, scope=scope)] + [
         convert(e, scope=scope) for e in coalesce.expressions
     ]
-    return ibis.coalesce(*args)
+    return ibis.coalesce(*_float_wins(args))
 
 
 @_convert.register(sge.Upper)
