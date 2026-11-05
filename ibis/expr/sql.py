@@ -1038,6 +1038,15 @@ def convert_binary(binary, scope):
     left, right = convert(left, scope), convert(right, scope)
     if isinstance(binary, _ARITHMETIC):
         left, right = _align_numeric(left, right)
+    if (
+        isinstance(binary, sge.Div)
+        and binary.args.get("typed")
+        and left.type().is_integer()
+        and right.type().is_integer()
+    ):
+        # sqlglot marks ``/`` typed in dialects (postgres, tsql, sqlite) where
+        # it divides integers to an integer, as ``//`` does in duckdb
+        op = _binary_operations[sge.IntDiv]
     return op(left, right)
 
 
@@ -1319,6 +1328,10 @@ def convert_truncate(trunc, scope):
 
 @_convert.register(sge.Round)
 def convert_round(func, scope):
+    truncate = func.args.get("truncate")
+    if truncate is not None and _literal_int(truncate) != 0:
+        # T-SQL's ``ROUND(x, n, 1)`` truncates instead of rounding
+        raise _unsupported(func, scope, "ROUND with truncation")
     this = convert(func.this, scope=scope)
     if (decimals := func.args.get("decimals")) is not None:
         return this.round(convert(decimals, scope=scope))
