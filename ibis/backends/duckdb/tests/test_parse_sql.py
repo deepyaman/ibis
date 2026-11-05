@@ -217,6 +217,11 @@ CASES = {
     "mixed_case_catalog_union": "SELECT id FROM employee UNION ALL SELECT ID FROM Employee ORDER BY Id",
     "cast_decimal_precision": "SELECT CAST(c AS DECIMAL(18, 3)) AS x, CAST(c AS DECIMAL(10, 2)) AS y FROM w",
     "cast_timestamp_drops_time_zone": "SELECT CAST(ts AS TIMESTAMP) AS n FROM w",
+    "paren_query_limit": "(SELECT a FROM t ORDER BY a DESC) LIMIT 2",
+    "paren_query_offset": "(SELECT a FROM t) OFFSET 3",
+    "paren_query_limit_derived": "SELECT * FROM ((SELECT a FROM t ORDER BY a DESC) LIMIT 2) AS s",
+    "paren_query_limit_cte": "WITH x AS ((SELECT a FROM t ORDER BY a) LIMIT 1) SELECT a FROM x",
+    "paren_query_with": "WITH x AS (SELECT a FROM t) (SELECT a FROM x ORDER BY a) LIMIT 1",
 }
 
 UNSUPPORTED = {

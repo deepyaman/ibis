@@ -687,7 +687,21 @@ def convert_relation(node, scope, **kwargs):
     if isinstance(node, sge.SetOperation):
         return convert_set_operation(node, scope)
     if isinstance(node, sge.Subquery):
-        return convert_relation(node.this, scope, **kwargs)
+        # ``(SELECT ...) LIMIT 1``: the parenthesized query's own WITH, ORDER
+        # BY, LIMIT and OFFSET are arguments of the Subquery node
+        for arg, what in (("pivots", "PIVOT"), ("sample", "TABLESAMPLE")):
+            if node.args.get(arg):
+                raise _unsupported(node, scope, what)
+        _bind_ctes(node, scope)
+        table = convert_relation(node.this, scope, **kwargs)
+        if (order := node.args.get("order")) is not None:
+            keys = scope.child()
+            keys.rel = table
+            keys.outputs = _keyed(
+                {name: table[name] for name in table.columns}, scope.root.dialect
+            )
+            table = table.order_by([convert(key, keys) for key in order.expressions])
+        return _limit(node, table, scope)
     raise _unsupported(node, scope)
 
 
