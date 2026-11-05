@@ -325,3 +325,65 @@ def test_set_operation_with_float_and_decimal_is_float64(sql):
     expr = ibis.parse_sql(sql, tables, dialect="postgres")
     assert expr.schema() == ibis.schema({"x": "float64"})
     assert "DECIMAL" not in ibis.to_sql(expr, dialect="postgres").upper()
+
+
+@pytest.mark.parametrize("dialect", [None, "duckdb", "postgres"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a FROM T",
+        "SELECT t.a FROM T AS t",
+        "WITH X AS (SELECT a FROM t) SELECT a FROM x",
+        "WITH x AS (SELECT a FROM t) SELECT a FROM X",
+    ],
+    ids=["table", "aliased_table", "cte_name", "cte_reference"],
+)
+def test_unquoted_names_are_compared_as_the_dialect_compares_them(sql, dialect):
+    expr = ibis.parse_sql(sql, tables, dialect=dialect)
+    assert expr.columns == ("a",)
+    assert 'FROM "t" AS "t0"' in ibis.to_sql(expr, dialect="postgres", pretty=False)
+
+
+@pytest.mark.parametrize(("dialect", "as_"), [("snowflake", "AS "), ("oracle", "")])
+def test_uppercasing_dialect_resolves_a_lowercase_catalog(dialect, as_):
+    expr = ibis.parse_sql("SELECT a, b FROM t WHERE a > 1", tables, dialect=dialect)
+    # these engines report the unquoted names upper-cased
+    assert expr.columns == ("A", "B")
+    assert ibis.to_sql(expr, dialect=dialect, pretty=False) == (
+        f'SELECT "t0"."a" AS "A", "t0"."b" AS "B" FROM "t" {as_}"t0" WHERE "t0"."a" > 1'
+    )
+
+
+def test_uppercasing_dialect_resolves_an_uppercase_catalog():
+    catalog = {"T": {"A": "int64"}}
+    expr = ibis.parse_sql("SELECT a FROM t", catalog, dialect="snowflake")
+    assert expr.columns == ("A",)
+    # the projection selects the whole table
+    assert ibis.to_sql(expr, dialect="snowflake", pretty=False) == 'SELECT * FROM "T"'
+    expr = ibis.parse_sql("SELECT a + 1 AS b FROM t", catalog, dialect="snowflake")
+    sql = ibis.to_sql(expr, dialect="snowflake", pretty=False)
+    assert sql == 'SELECT "t0"."A" + 1 AS "B" FROM "T" AS "t0"'
+
+
+def test_postgres_resolves_an_uppercase_table_name():
+    expr = ibis.parse_sql("SELECT A, b FROM T", tables, dialect="postgres")
+    assert expr.columns == ("a", "b")
+    sql = ibis.to_sql(expr, dialect="postgres", pretty=False)
+    assert sql == 'SELECT "t0"."a", "t0"."b" FROM "t" AS "t0"'
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "table"),
+    [
+        ("SELECT a FROM nope", "duckdb", "nope"),
+        ("SELECT a FROM nope", "snowflake", "nope"),
+        # a quoted name is compared exactly, except by case-insensitive DuckDB
+        ('SELECT a FROM "T"', "postgres", "T"),
+        # ClickHouse compares identifiers case-sensitively
+        ("SELECT a FROM T", "clickhouse", "T"),
+        ("WITH x AS (SELECT a FROM t) SELECT a FROM y", "duckdb", "y"),
+    ],
+)
+def test_unknown_table_is_named(sql, dialect, table):
+    with pytest.raises(com.IbisInputError, match=f"Table '{table}' is not in"):
+        ibis.parse_sql(sql, tables, dialect=dialect)
