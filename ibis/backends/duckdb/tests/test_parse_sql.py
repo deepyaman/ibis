@@ -163,6 +163,7 @@ CASES = {
     "window_order_by_dropped": "SELECT a, SUM(c) OVER (PARTITION BY b) AS s FROM t ORDER BY b",
     "subq_in_join_source": "SELECT t.a, s.m FROM t JOIN (SELECT a, MAX(c) AS m FROM t GROUP BY a) AS s ON t.a = s.a WHERE s.m > 1",
     "join_on_subquery_eq": "SELECT t.a FROM t JOIN u ON t.a = u.a AND t.c > (SELECT AVG(c) FROM t)",
+    "join_on_subquery_then_left_join": "SELECT t.a, u.x, v.a AS va FROM t JOIN u ON t.a = u.a AND t.c > (SELECT AVG(c) FROM t) LEFT JOIN t AS v ON u.a = v.a",
     "three_way_comma": "SELECT t.a, t2.b FROM t, u, t AS t2 WHERE t.a = u.a AND u.a = t2.a AND t2.c > 1",
     "comma_join_where_or": "SELECT t.a FROM t, u WHERE (t.a = u.a AND t.c > 1) OR (t.a = u.a + 1 AND t.c < 1)",
     "left_join_filter_right": "SELECT t.a FROM t LEFT JOIN u ON t.a = u.a WHERE u.x = 'p'",
@@ -233,6 +234,16 @@ UNSUPPORTED = {
         "GROUPING SETS",
     ),
     "natural_join": ("SELECT * FROM t NATURAL JOIN u", "NATURAL join"),
+    "join_subquery_on_then_right_join": (
+        "SELECT t.a, u.x, v.a AS va FROM t JOIN u ON t.a = u.a "
+        "AND t.c > (SELECT AVG(c) FROM t) RIGHT JOIN t AS v ON u.a = v.a",
+        "before a RIGHT or FULL join",
+    ),
+    "join_subquery_on_then_full_join": (
+        "SELECT t.a, u.x, v.a AS va FROM t JOIN u ON t.a = u.a "
+        "AND t.c > (SELECT AVG(c) FROM t) FULL JOIN t AS v ON u.a = v.a",
+        "before a RIGHT or FULL join",
+    ),
     "comma_then_right_join": (
         "SELECT t.a, u.x, v.a AS va FROM t, u RIGHT JOIN t AS v ON u.a = v.a",
         "after a comma",

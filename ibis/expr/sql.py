@@ -427,6 +427,15 @@ def _build_from(select, scope):
             raise _unsupported(
                 join, scope, "A subquery or outer reference in an outer join condition"
             )
+        if late and any(later.side in ("RIGHT", "FULL") for later in joins[i + 1 :]):
+            # the filter after the chain would drop the rows a later outer
+            # join extends with NULLs
+            raise _unsupported(
+                join,
+                scope,
+                "A subquery or outer reference in a join condition "
+                "before a RIGHT or FULL join",
+            )
         deferred.extend(late)
         _reject_aggregates(on, scope, "a join condition")
         predicates = [_boolean(condition, scope) for condition in local]
