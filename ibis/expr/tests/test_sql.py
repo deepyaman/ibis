@@ -290,3 +290,38 @@ def test_non_integer_literal_is_float64(literal, dialect):
     expr = ibis.parse_sql(f"SELECT a * {literal} AS q FROM t", tables, dialect=dialect)
     assert expr.schema() == ibis.schema({"q": "float64"})
     assert "DECIMAL" not in ibis.to_sql(expr, dialect="duckdb").upper()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "CASE WHEN a > 1 THEN c / 3 ELSE e END",
+        "CASE a WHEN 1 THEN e ELSE c / 3 END",
+        "IF(a > 1, e, c / 3)",
+        "COALESCE(e, c / 3)",
+        "NULLIF(e, c)",
+        "GREATEST(e, c / 3)",
+        "LEAST(c / 3, e)",
+        "e * c",
+    ],
+)
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", "clickhouse"])
+def test_float_and_decimal_operands_are_float64(value, dialect):
+    tables = {"t": {"a": "int64", "c": "float64", "e": "decimal(3, 2)"}}
+    expr = ibis.parse_sql(f"SELECT {value} AS x FROM t", tables, dialect=dialect)
+    assert expr.schema() == ibis.schema({expr.columns[0]: "float64"})
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT c AS x FROM t UNION ALL SELECT e FROM t",
+        "SELECT e AS x FROM t UNION ALL SELECT c FROM t",
+        "SELECT e AS x FROM t INTERSECT SELECT c FROM t",
+    ],
+)
+def test_set_operation_with_float_and_decimal_is_float64(sql):
+    tables = {"t": {"c": "float64", "e": "decimal(3, 2)"}}
+    expr = ibis.parse_sql(sql, tables, dialect="postgres")
+    assert expr.schema() == ibis.schema({"x": "float64"})
+    assert "DECIMAL" not in ibis.to_sql(expr, dialect="postgres").upper()
