@@ -387,3 +387,21 @@ def test_postgres_resolves_an_uppercase_table_name():
 def test_unknown_table_is_named(sql, dialect, table):
     with pytest.raises(com.IbisInputError, match=f"Table '{table}' is not in"):
         ibis.parse_sql(sql, tables, dialect=dialect)
+
+
+@pytest.mark.parametrize("dialect", [None, "duckdb"])
+def test_cast_to_another_parameterization_is_kept(dialect):
+    catalog = {"t": {"c": "decimal(10, 2)", "ts": "timestamp('UTC')"}}
+    sql = (
+        "SELECT CAST(c AS DECIMAL(18, 3)) AS x, CAST(ts AS TIMESTAMP) AS n, "
+        "CAST(c AS DECIMAL(10, 2)) AS y FROM t"
+    )
+    expr = ibis.parse_sql(sql, catalog, dialect=dialect)
+    assert expr.schema() == ibis.schema(
+        {"x": "decimal(18, 3)", "n": "timestamp", "y": "decimal(10, 2)"}
+    )
+    # the cast to the column's own type is redundant
+    assert ibis.to_sql(expr, dialect="duckdb", pretty=False) == (
+        'SELECT CAST("t0"."c" AS DECIMAL(18, 3)) AS "x", '
+        'CAST("t0"."ts" AS TIMESTAMP) AS "n", "t0"."c" AS "y" FROM "t" AS "t0"'
+    )
