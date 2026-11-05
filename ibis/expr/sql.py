@@ -568,8 +568,8 @@ def _is_identity(values, rel) -> bool:
     return True
 
 
-def _project(rel, values, elide=True):
-    if elide and _is_identity(values, rel):
+def _project(rel, values):
+    if _is_identity(values, rel):
         return rel
     if isinstance(rel, ir.Join) and all(_is_plain(value) for value in values):
         # a plain projection of the join's members is the join's own output
@@ -694,12 +694,10 @@ def convert_relation(node, scope, **kwargs):
     raise _unsupported(node, scope)
 
 
-def convert_select(select, scope, *, projection=True, elide=True):
+def convert_select(select, scope, *, projection=True):
     """Convert a SELECT against ``scope``.
 
-    With ``projection=False`` only the rows are kept (``EXISTS``). With
-    ``elide=False`` a projection is built even when it selects every column
-    (a scalar subquery needs one).
+    With ``projection=False`` only the rows are kept (``EXISTS``).
     """
     _reject_unsupported(select, scope)
     _bind_ctes(select, scope)
@@ -745,7 +743,7 @@ def convert_select(select, scope, *, projection=True, elide=True):
     )
     _check_no_reductions(values, select, scope)
     distinct = select.args.get("distinct") is not None
-    rel = _project(scope.rel, values, elide=elide)
+    rel = _project(scope.rel, values)
     if distinct:
         rel = rel.distinct()
     if order is not None:
@@ -868,9 +866,20 @@ def convert(node, scope):
         raise _invalid(node, scope, f"Cannot translate ({e})") from e
 
 
+def _subquery_body(rel):
+    """``rel`` as a subquery the compiler can nest.
+
+    The compiler puts the subquery's SELECT inside the outer query; a bare
+    table or reference has none.
+    """
+    if isinstance(rel.op(), (ops.PhysicalTable, ops.Reference)):
+        rel = rel.select(rel.columns)
+    return rel
+
+
 @_convert.register(sge.Subquery)
 def convert_subquery(subquery, scope):
-    table = convert_relation(subquery.this, scope.child(), elide=False)
+    table = _subquery_body(convert_relation(subquery.this, scope.child()))
     if len(table.columns) != 1:
         raise com.IbisInputError(
             f"A scalar subquery must return one column: {subquery.sql(dialect=scope.root.dialect)}"
@@ -880,11 +889,7 @@ def convert_subquery(subquery, scope):
 
 @_convert.register(sge.Exists)
 def convert_exists(exists, scope):
-    rel = convert_relation(exists.this, scope.child(), projection=False)
-    if isinstance(rel.op(), (ops.PhysicalTable, ops.Reference)):
-        # the compiler puts the subquery's SELECT inside EXISTS; a bare table
-        # has none
-        rel = rel.select(rel.columns)
+    rel = _subquery_body(convert_relation(exists.this, scope.child(), projection=False))
     return ops.ExistsSubquery(rel.op()).to_expr()
 
 

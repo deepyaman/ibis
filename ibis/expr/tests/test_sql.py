@@ -476,3 +476,16 @@ def test_fractional_bigquery_date_add_is_rejected():
         ibis.parse_sql(
             "SELECT DATE_ADD(d, INTERVAL 1.5 DAY) AS r FROM t", t, dialect="bigquery"
         )
+
+
+def test_scalar_subquery_is_not_wrapped_in_a_projection():
+    t = {"t": {"a": "int64", "c": "float64"}, "v": {"x": "int64"}}
+    expr = ibis.parse_sql(
+        "SELECT a FROM t WHERE c > (SELECT AVG(c) FROM t)", t, dialect="duckdb"
+    )
+    assert ibis.to_sql(expr, dialect="duckdb").count("SELECT") == 2
+    # a bare one-column table still needs a SELECT of its own to nest
+    expr = ibis.parse_sql(
+        "SELECT a FROM t WHERE a = (SELECT * FROM v)", t, dialect="duckdb"
+    )
+    ibis.to_sql(expr, dialect="duckdb")
