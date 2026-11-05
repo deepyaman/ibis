@@ -280,3 +280,13 @@ def test_concat_null_handling_follows_the_dialect():
 def test_from_less_select_keeps_its_order_by():
     expr = ibis.parse_sql("SELECT 2 AS two, 1 AS one ORDER BY one", tables)
     assert isinstance(expr.op(), ops.Sort)
+
+
+@pytest.mark.parametrize(
+    "literal", ["1.5", "0.1", "100.0000", "-0.333", "1e2", "1.5E-3"]
+)
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", "clickhouse"])
+def test_non_integer_literal_is_float64(literal, dialect):
+    expr = ibis.parse_sql(f"SELECT a * {literal} AS q FROM t", tables, dialect=dialect)
+    assert expr.schema() == ibis.schema({"q": "float64"})
+    assert "DECIMAL" not in ibis.to_sql(expr, dialect="duckdb").upper()

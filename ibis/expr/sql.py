@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import decimal
 import operator
 import re
 from dataclasses import dataclass, field
@@ -868,21 +867,14 @@ def convert_filtered_aggregate(node, scope):
 
 
 def _number(text):
-    """A non-integer numeric literal.
+    """A non-integer numeric literal, typed ``float64`` as Ibis types it.
 
-    Written with a decimal point it is a decimal typed by its digits, as SQL
-    engines type it (``1.10`` is ``decimal(3, 2)``); written with an exponent
-    it is a float.
+    Engines type a literal written with a decimal point by its digits
+    (``1.5`` is ``decimal(2, 1)``) and widen the result of arithmetic on it;
+    Ibis would keep the literal's narrow type for the result and fail to
+    fetch a value that does not fit it.
     """
-    if "e" in text.lower():
-        return ibis.literal(float(text))
-    whole, _, fraction = text.lstrip("-").partition(".")
-    precision = len(whole or "0") + len(fraction)
-    if precision > 38:
-        return ibis.literal(float(text))
-    return ibis.literal(
-        decimal.Decimal(text), type=dt.Decimal(precision, len(fraction))
-    )
+    return ibis.literal(float(text))
 
 
 @_convert.register(sge.Literal)
@@ -1695,8 +1687,8 @@ def parse_sql(sqlstring, catalog, dialect=None):
 
     Notes
     -----
-    A numeric literal written with a decimal point is typed ``decimal`` by its
-    digits, as engines type it; written with an exponent it is ``float64``.
+    A numeric literal written with a decimal point or an exponent is typed
+    ``float64``, as Ibis types ``ibis.literal(1.5)``.
     A ``SUBSTRING`` whose start is a literal before 1 is rejected, because
     engines disagree on what it means; a computed start before 1 follows
     Ibis, which counts a negative start from the end of the string.

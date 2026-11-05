@@ -76,6 +76,7 @@ CASES = {
     "decimal_literal_arithmetic": "SELECT c * 0.5 AS h, c / 0.25 AS q, a * 1.25 AS p, c + 0.1 AS plus, 0.1 + c AS plus2 FROM t",
     "decimal_literal_scale": "SELECT SUM(a) * 0.0001000000 AS x, SUM(a) * 100.0000 AS y FROM t",
     "decimal_column_literal_scale": "SELECT CAST(c AS DECIMAL(10, 2)) * 1.00000 AS z, CAST(c AS DECIMAL(10, 2)) + 0.0001 AS w FROM t",
+    "decimal_literal_wide_result": "SELECT a * 1000000 * 1.5 AS q, a * 1000000 * 0.1 AS r, a * 1000 + 0.25 AS s FROM t",
     "arithmetic_alias": "SELECT a * 2 + 1 AS z, c / 2 AS h FROM t",
     "window_row_number": "SELECT a, ROW_NUMBER() OVER (PARTITION BY b ORDER BY a) AS rn FROM t",
     "window_cumulative_sum": "SELECT a, SUM(c) OVER (ORDER BY a) AS cs FROM t",
@@ -345,15 +346,19 @@ OLD_SQLGLOT["limit_percent"] = pytest.mark.skipif(
     reason="sqlglot rejects LIMIT n% as syntax before 28.0",
 )
 
+_FLOAT_LITERALS = pytest.mark.xfail(
+    reason=(
+        "decimal-point literals are typed float64, as Ibis types them; DuckDB "
+        "types them by their digits, so the engine's result type differs for "
+        "decimal arithmetic (values agree; #10890)"
+    ),
+    strict=True,
+)
 # the SQL Ibis compiles these to returns a different result, for the reason given
 MISCOMPILED = {
-    "decimal_literal": pytest.mark.xfail(
-        reason=(
-            "Ibis compiles the float 1e2 as 100.0, which DuckDB reads as a decimal: "
-            "https://github.com/ibis-project/ibis/issues/10890"
-        ),
-        strict=True,
-    )
+    "decimal_literal": _FLOAT_LITERALS,
+    "decimal_literal_scale": _FLOAT_LITERALS,
+    "decimal_column_literal_scale": _FLOAT_LITERALS,
 }
 
 
@@ -409,6 +414,25 @@ def test_parse_sql_invalid(sql, message):
     """Invalid SQL raises an input error that names the offending SQL."""
     with pytest.raises(com.IbisInputError, match=message):
         ibis.parse_sql(sql, CATALOG, dialect="duckdb")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a * 1000000 * 1.5 AS q FROM t",
+        "SELECT a * 1000000 * 0.1 AS q FROM t",
+        "SELECT a * 1000 + 0.25 AS q FROM t",
+        "SELECT SUM(a) * 100.0000 AS q FROM t",
+        "SELECT CAST(c AS DECIMAL(10, 2)) * 0.333 AS q FROM t",
+    ],
+)
+def test_parse_sql_fetches_decimal_literal_arithmetic(duck, sql):
+    """A decimal-point literal's type fits the result Ibis fetches."""
+    con = ibis.duckdb.from_connection(duck)
+    expr = ibis.parse_sql(sql, CATALOG, dialect="duckdb")
+    expected = duck.execute(sql).fetch_df()["q"].astype("float64")
+    result = con.to_pandas(expr)["q"].astype("float64")
+    pd.testing.assert_series_equal(result, expected, check_exact=False)
 
 
 def test_comparator_checks_row_order(duck):
