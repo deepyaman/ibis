@@ -468,3 +468,24 @@ def test_scalar_max_of_two_arguments_is_rejected():
     # SQLite's MAX of two arguments is the greater of them, not an aggregate
     with pytest.raises(com.UnsupportedOperationError, match="MAX"):
         ibis.parse_sql("SELECT MAX(a, c) AS m FROM t", tables, dialect="sqlite")
+
+
+def test_parse_sql_named_window_chain_keeps_every_level():
+    # DuckDB itself drops w1's PARTITION BY three levels deep, so this is not
+    # checked against its rows
+    sql = (
+        "SELECT SUM(id) OVER w3 AS s FROM employee WINDOW w1 AS "
+        "(PARTITION BY first_name), w2 AS (w1 ORDER BY last_name), "
+        "w3 AS (w2 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+    )
+    (window,) = ibis.parse_sql(sql, catalog).op().find(ops.WindowFunction)
+    assert [key.name for key in window.group_by] == ["first_name"]
+    assert [key.name for key in window.order_by] == ["last_name"]
+    assert window.how == "rows"
+    assert window.start.value.value == 1
+
+
+def test_parse_sql_named_window_cycle():
+    sql = "SELECT SUM(id) OVER w1 AS s FROM employee WINDOW w1 AS (w2), w2 AS (w1)"
+    with pytest.raises(com.IbisInputError, match="refers to itself"):
+        ibis.parse_sql(sql, catalog)

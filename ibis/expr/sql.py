@@ -1272,28 +1272,33 @@ def _window_bound(value, side, scope):
     return -offset if (side or "").upper() == "PRECEDING" else offset
 
 
-def _window_parts(window, scope):
+def _window_parts(window, scope, seen=()):
     """The PARTITION BY, ORDER BY and frame of ``window``.
 
     ``OVER w`` takes all three from the WINDOW clause; ``OVER (w ...)`` may add
     an ORDER BY and a frame to a named window that has none, not a partition.
+    A WINDOW definition may itself build on another named window.
     """
     parts = {name: window.args.get(name) for name in ("partition_by", "order", "spec")}
     if (alias := window.args.get("alias")) is None:
         return parts
-    if (named := scope.windows.get(alias.name)) is None:
+    if (definition := scope.windows.get(alias.name)) is None:
         raise _unsupported(window, scope, f"The window {alias.name!r}")
+    if alias.name in seen:
+        raise _invalid(window, scope, f"The window {alias.name!r} refers to itself")
+    # follow the chain: ``w2 AS (w1 ORDER BY a)`` keeps w1's PARTITION BY
+    named = _window_parts(definition, scope, (*seen, alias.name))
     if parts["partition_by"]:
         raise _invalid(
             window, scope, f"Cannot override the PARTITION BY of {alias.name!r}"
         )
-    if any(parts.values()) and named.args.get("spec") is not None:
+    if any(parts.values()) and named["spec"] is not None:
         raise _invalid(
             window, scope, f"Cannot extend the window {alias.name!r}: it has a frame"
         )
-    if parts["order"] is not None and named.args.get("order") is not None:
+    if parts["order"] is not None and named["order"] is not None:
         raise _invalid(window, scope, f"Cannot override the ORDER BY of {alias.name!r}")
-    return {name: part or named.args.get(name) for name, part in parts.items()}
+    return {name: part or named[name] for name, part in parts.items()}
 
 
 @_convert.register(sge.Window)

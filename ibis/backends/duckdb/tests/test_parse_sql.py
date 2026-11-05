@@ -222,6 +222,8 @@ CASES = {
     "window_column_bound": "SELECT a, SUM(c) OVER (ORDER BY d ROWS BETWEEN a PRECEDING AND CURRENT ROW) AS s FROM t",
     "window_expression_bound": "SELECT a, SUM(c) OVER (ORDER BY d ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW) AS s FROM t",
     "window_fractional_bound": "SELECT a, SUM(c) OVER (ORDER BY c RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM t",
+    "named_window_chain": "SELECT a, b, SUM(c) OVER w2 AS s FROM t WINDOW w1 AS (PARTITION BY b), w2 AS (w1 ORDER BY a)",
+    "named_window_chain_row_number": "SELECT a, c, ROW_NUMBER() OVER w2 AS r FROM t WINDOW w1 AS (PARTITION BY a), w2 AS (w1 ORDER BY c)",
 }
 
 UNSUPPORTED = {
