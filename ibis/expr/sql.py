@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import contextlib
 import operator
-import re
 from dataclasses import dataclass, field
 from functools import singledispatch
 
@@ -194,8 +193,10 @@ def _unsupported(node, scope, what=None):
     sql = node.sql(dialect=dialect) if isinstance(node, sge.Expression) else str(node)
     if what is None:
         what = type(node).__name__
-        if isinstance(node, sge.Func) and (call := re.match(r"[\w.]+(?=\()", sql)):
-            what = f"The function {call.group()}"
+        if isinstance(node, sge.Func):
+            # the node's own name: a dialect may render it as another construct
+            name = node.name if isinstance(node, sge.Anonymous) else node.sql_name()
+            what = f"The function {name}"
     return com.UnsupportedOperationError(f"{what} is not supported: {sql}")
 
 

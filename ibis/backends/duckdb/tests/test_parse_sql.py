@@ -299,6 +299,7 @@ UNSUPPORTED = {
     "from_less_count_plus_one": ("SELECT COUNT(1) + 1 AS n", "without a FROM"),
     "from_less_sum": ("SELECT SUM(1) AS n", "without a FROM"),
     "from_less_max": ("SELECT MAX(1) AS n", "without a FROM"),
+    "date_function": ("SELECT DATE(ts) AS d2 FROM t", "The function DATE "),
     "fractional_interval": (
         "SELECT a, d + INTERVAL '1.5' DAY AS d2 FROM t",
         "fractional interval",
