@@ -1072,6 +1072,9 @@ def convert_binary(binary, scope):
         # sqlglot marks ``/`` typed in dialects (postgres, tsql, sqlite) where
         # it divides integers to an integer, as ``//`` does in duckdb
         op = _binary_operations[sge.IntDiv]
+    if isinstance(binary, sge.Sub) and left.type().is_date() and right.type().is_date():
+        # SQL subtracts two dates to the integer number of days between them
+        return left.delta(right, unit="day")
     return op(left, right)
 
 

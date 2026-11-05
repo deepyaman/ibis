@@ -76,6 +76,8 @@ CASES = {
     "string_functions": "SELECT UPPER(b) AS ub, LENGTH(b) AS lb, SUBSTRING(b, 1, 2) AS sb FROM t",
     "date_functions": "SELECT EXTRACT(year FROM d) AS y, DATE_TRUNC('month', ts) AS m FROM t",
     "date_add_interval": "SELECT DATE_ADD(d, INTERVAL 1 DAY) AS d1, DATE_ADD(ts, INTERVAL 2 HOUR) AS t2, DATE_ADD(d, INTERVAL '3' MONTH) AS m3 FROM t",
+    "date_difference": "SELECT d - DATE '2024-01-01' AS n, (CURRENT_DATE - d) / 30 AS m, DATE '2024-03-01' - d > 0 AS p FROM t",
+    "date_difference_avg": "SELECT AVG(CURRENT_DATE - d) AS m, SUM(d - DATE '2024-01-01') AS s FROM t",
     "date_arithmetic": "SELECT a FROM t WHERE d >= DATE '2024-02-01' AND d < DATE '2024-02-01' + INTERVAL '1' MONTH",
     "cast": "SELECT CAST(a AS VARCHAR) AS s FROM t",
     "decimal_literal": "SELECT CAST(1.10 AS VARCHAR) AS s, 1.50 AS x, 0.1 + 0.2 = 0.3 AS eq, 1e2 AS e FROM t",
