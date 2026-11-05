@@ -1,0 +1,6 @@
+SELECT
+  "t2"."a",
+  SUM("t2"."c") OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "s"
+FROM "t" AS "t2"
+INNER JOIN "u" AS "t3"
+  ON "t2"."a" = "t3"."a"

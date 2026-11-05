@@ -919,3 +919,22 @@ def test_join_with_conditional_aggregate(snapshot):
     stat = right.filter(right.by == left.by, right.on <= left.on)["on"].max()
     merged = left.join(right, left.by == right.by, how="left").filter(right.on == stat)
     snapshot.assert_match(to_sql(merged), "result.sql")
+
+
+@pytest.mark.parametrize(
+    "make_values",
+    [
+        param(lambda **_: {"r": ibis.row_number()}, id="analytic"),
+        param(lambda t, **_: {"s": t.c.sum()}, id="left_reduction"),
+        param(lambda u, **_: {"m": u.a.max()}, id="right_reduction"),
+        param(lambda t, **_: {"d": t.c - t.c.mean()}, id="nested_reduction"),
+        param(lambda u, **_: {"x": u.x}, id="plain_projection"),
+        param(lambda one, **_: {"o": one.a.max()}, id="foreign_reduction"),
+    ],
+)
+def test_join_select_window_functions(make_values, snapshot):
+    t = ibis.table({"a": "int64", "c": "float64"}, name="t")
+    u = ibis.table({"a": "int64", "x": "string"}, name="u")
+    one = ibis.table({"a": "int64"}, name="one")
+    expr = t.join(u, t.a == u.a).select(t.a, **make_values(t=t, u=u, one=one))
+    snapshot.assert_match(to_sql(expr), "out.sql")

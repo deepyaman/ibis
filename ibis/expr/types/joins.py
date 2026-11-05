@@ -16,7 +16,11 @@ from ibis.common.exceptions import (
     InputTypeError,
     IntegrityError,
 )
-from ibis.expr.rewrites import flatten_predicates, peel_join_field
+from ibis.expr.rewrites import (
+    flatten_predicates,
+    peel_join_field,
+    rewrite_project_input,
+)
 from ibis.expr.types.generic import Value
 from ibis.expr.types.relations import (
     DerefMap,
@@ -385,7 +389,8 @@ class Join(Table):
         values = unwrap_aliases(values)
 
         links = [link.table for link in chain.rest if link.how not in ("semi", "anti")]
-        derefmap = DerefMap.from_targets([chain.first, *links])
+        tables = [chain.first, *links]
+        derefmap = DerefMap.from_targets(tables)
 
         # if there are values referencing fields from the join chain constructed
         # so far, we need to replace them the fields from one of the join links
@@ -397,7 +402,9 @@ class Join(Table):
         for k, v in values.items():
             # ensure that there's only a single thing returned from dereferencing
             (new_value,) = derefmap.dereference(v)
-            new_values[k] = new_value
+            # reductions and analytic functions become window functions over
+            # the join (or scalar subqueries), as in Table.select
+            new_values[k] = rewrite_project_input(new_value, relation=tables)
 
         node = chain.copy(values=new_values)
         return Table(node)

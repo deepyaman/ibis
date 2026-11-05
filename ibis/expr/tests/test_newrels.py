@@ -621,6 +621,39 @@ def test_join_unambiguous_select():
         )
 
 
+def test_join_select_windowizes_reductions_and_analytic_functions():
+    t = ibis.table(name="t", schema={"a": "int64", "c": "float64"})
+    u = ibis.table(name="u", schema={"a": "int64", "x": "string"})
+    one = ibis.table(name="one", schema={"a": "int64"})
+
+    join = t.join(u, t.a == u.a)
+    expr = join.select(
+        t.a,
+        r=ibis.row_number(),
+        s=t.c.sum(),
+        m=u.a.max(),
+        d=t.c - t.c.mean(),
+        x=u.x,
+        o=one.a.max(),
+    )
+
+    with join_tables(join) as (r1, r2):
+        assert expr.op() == JoinChain(
+            first=r1,
+            rest=[JoinLink("inner", r2, [r1.a == r2.a])],
+            values={
+                "a": r1.a,
+                "r": ops.WindowFunction(ops.RowNumber()),
+                "s": r1.c.sum().over(),
+                "m": r2.a.max().over(),
+                "d": r1.c - r1.c.mean().over(),
+                "x": r2.x,
+                # a reduction over a table outside the join is a scalar subquery
+                "o": ops.ScalarSubquery(one.a.max().as_table()),
+            },
+        )
+
+
 def test_join_with_subsequent_projection():
     t1 = ibis.table(name="t1", schema={"a": "int64", "b": "string"})
     t2 = ibis.table(name="t2", schema={"c": "int64", "d": "string"})

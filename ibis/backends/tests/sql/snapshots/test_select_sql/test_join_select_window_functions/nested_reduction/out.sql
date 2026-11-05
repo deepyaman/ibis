@@ -1,0 +1,6 @@
+SELECT
+  "t2"."a",
+  "t2"."c" - AVG("t2"."c") OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "d"
+FROM "t" AS "t2"
+INNER JOIN "u" AS "t3"
+  ON "t2"."a" = "t3"."a"
