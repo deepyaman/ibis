@@ -1594,6 +1594,8 @@ def _literal_int(node) -> int | None:
 @_convert.register(sge.Substring)
 def convert_substring(substring, scope):
     this = convert(substring.this, scope=scope)
+    if substring.args.get("start") is None:
+        raise _invalid(substring, scope, "SUBSTRING takes a start")
     if (start := _literal_int(substring.args["start"])) is not None and start < 1:
         # engines disagree on what a start before the first character means
         raise _unsupported(substring, scope, "SUBSTRING with a start before 1")
@@ -1692,6 +1694,15 @@ def _unit(node, units, parent, scope):
     return unit
 
 
+def _interval_count(literal, parent, scope):
+    """The whole number of units of an interval literal."""
+    try:
+        return int(literal.name)
+    except ValueError:
+        # Ibis intervals count whole units
+        raise _unsupported(parent, scope, "A fractional interval") from None
+
+
 @_convert.register(sge.DateAdd)
 @_convert.register(sge.DateSub)
 def convert_date_add(func, scope):
@@ -1699,7 +1710,7 @@ def convert_date_add(func, scope):
     unit = func.args.get("unit")
     if isinstance(func.expression, sge.Literal):
         unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
-        interval = ibis.interval(int(func.expression.name), unit)
+        interval = ibis.interval(_interval_count(func.expression, func, scope), unit)
     else:
         # the argument may be an interval already (``DATE_ADD(d, INTERVAL 1
         # DAY)``) or a number of ``unit``
@@ -1714,7 +1725,7 @@ def convert_date_add(func, scope):
 def convert_interval(interval, scope):
     unit = _unit(interval.args.get("unit"), _interval_units, interval, scope)
     if isinstance(interval.this, sge.Literal):
-        return ibis.interval(int(interval.this.name), unit)
+        return ibis.interval(_interval_count(interval.this, interval, scope), unit)
     return convert(interval.this, scope=scope).as_interval(unit)
 
 

@@ -468,3 +468,11 @@ def test_scalar_max_of_two_arguments_is_rejected():
     # SQLite's MAX of two arguments is the greater of them, not an aggregate
     with pytest.raises(com.UnsupportedOperationError, match="MAX"):
         ibis.parse_sql("SELECT MAX(a, c) AS m FROM t", tables, dialect="sqlite")
+
+
+def test_fractional_bigquery_date_add_is_rejected():
+    t = {"t": {"d": "date"}}
+    with pytest.raises(com.UnsupportedOperationError, match="fractional interval"):
+        ibis.parse_sql(
+            "SELECT DATE_ADD(d, INTERVAL 1.5 DAY) AS r FROM t", t, dialect="bigquery"
+        )

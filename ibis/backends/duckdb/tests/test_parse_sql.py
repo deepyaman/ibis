@@ -296,6 +296,18 @@ UNSUPPORTED = {
     "from_less_count_plus_one": ("SELECT COUNT(1) + 1 AS n", "without a FROM"),
     "from_less_sum": ("SELECT SUM(1) AS n", "without a FROM"),
     "from_less_max": ("SELECT MAX(1) AS n", "without a FROM"),
+    "fractional_interval": (
+        "SELECT a, d + INTERVAL '1.5' DAY AS d2 FROM t",
+        "fractional interval",
+    ),
+    "fractional_interval_string": (
+        "SELECT ts + INTERVAL '1.5 hours' AS r FROM t",
+        "fractional interval",
+    ),
+    "fractional_date_add": (
+        "SELECT DATE_ADD(ts, INTERVAL '1.5' HOUR) AS r FROM t",
+        "fractional interval",
+    ),
 }
 
 # SQL that is invalid, or that Ibis cannot type, raises an input error
@@ -360,6 +372,7 @@ INVALID = {
     ),
     "where_not_boolean": ("SELECT a FROM t WHERE b", "not boolean"),
     "join_not_boolean": ("SELECT t.a FROM t JOIN u ON u.x", "not boolean"),
+    "substring_without_start": ("SELECT SUBSTRING(b) AS s FROM t", "start"),
     "syntax_error": ("SELEC a FROM t", "Cannot parse"),
     "two_statements": ("SELECT a FROM t; SELECT a FROM u", "one statement"),
     "empty": ("", "one statement"),
