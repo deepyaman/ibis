@@ -217,6 +217,9 @@ CASES = {
     "mixed_case_catalog_union": "SELECT id FROM employee UNION ALL SELECT ID FROM Employee ORDER BY Id",
     "cast_decimal_precision": "SELECT CAST(c AS DECIMAL(18, 3)) AS x, CAST(c AS DECIMAL(10, 2)) AS y FROM w",
     "cast_timestamp_drops_time_zone": "SELECT CAST(ts AS TIMESTAMP) AS n FROM w",
+    "interval_millisecond": "SELECT ts + INTERVAL 5 MILLISECOND AS r FROM t",
+    "date_add_millisecond": "SELECT DATE_ADD(ts, INTERVAL 5 MILLISECOND) AS r FROM t",
+    "interval_microseconds": "SELECT ts - INTERVAL '7' MICROSECONDS AS r FROM t",
 }
 
 UNSUPPORTED = {

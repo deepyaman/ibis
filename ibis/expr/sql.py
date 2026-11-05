@@ -25,6 +25,8 @@ import ibis.expr.types as ir
 from ibis.backends.sql.datatypes import SqlglotType
 from ibis.common.annotations import ValidationError
 from ibis.common.deferred import Deferred
+from ibis.common.temporal import IntervalUnit
+from ibis.common.typing import CoercionError
 from ibis.util import experimental
 
 # The optimizer rules run before conversion. ``qualify`` resolves every column
@@ -1344,25 +1346,11 @@ def convert_window(window, scope):
     return result
 
 
-_truncation_units = {
-    "year": "Y",
-    "quarter": "Q",
-    "month": "M",
-    "week": "W",
-    "day": "D",
-    "hour": "h",
-    "minute": "m",
-    "second": "s",
-    "millisecond": "ms",
-    "microsecond": "us",
-}
-
-
 @_convert.register(sge.TimestampTrunc)
 @_convert.register(sge.DateTrunc)
 def convert_truncate(trunc, scope):
     this = convert(trunc.this, scope=scope)
-    return this.truncate(_unit(trunc.args.get("unit"), _truncation_units, trunc, scope))
+    return this.truncate(_unit(trunc.args.get("unit"), trunc, scope))
 
 
 @_convert.register(sge.Round)
@@ -1675,23 +1663,14 @@ def convert_anonymous(func, scope):
     raise _unsupported(func, scope, f"The function {func.name}")
 
 
-_interval_units = {
-    "year": "Y",
-    "quarter": "Q",
-    "month": "M",
-    "week": "W",
-    "day": "D",
-    "hour": "h",
-    "minute": "m",
-    "second": "s",
-}
-
-
-def _unit(node, units, parent, scope):
+def _unit(node, parent, scope):
     """The Ibis unit for a date or interval unit of the SQL."""
-    if node is None or (unit := units.get(node.name.lower().removesuffix("s"))) is None:
-        raise _unsupported(parent, scope, f"The unit {getattr(node, 'name', None)!r}")
-    return unit
+    try:
+        return IntervalUnit.from_string(node.name.lower())
+    except (AttributeError, CoercionError):
+        raise _unsupported(
+            parent, scope, f"The unit {getattr(node, 'name', None)!r}"
+        ) from None
 
 
 def _interval_count(literal, parent, scope):
@@ -1709,21 +1688,21 @@ def convert_date_add(func, scope):
     this = convert(func.this, scope=scope)
     unit = func.args.get("unit")
     if isinstance(func.expression, sge.Literal):
-        unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
+        unit = "D" if unit is None else _unit(unit, func, scope)
         interval = ibis.interval(_interval_count(func.expression, func, scope), unit)
     else:
         # the argument may be an interval already (``DATE_ADD(d, INTERVAL 1
         # DAY)``) or a number of ``unit``
         interval = convert(func.expression, scope=scope)
         if not interval.type().is_interval():
-            unit = "D" if unit is None else _unit(unit, _interval_units, func, scope)
+            unit = "D" if unit is None else _unit(unit, func, scope)
             interval = interval.as_interval(unit)
     return this - interval if isinstance(func, sge.DateSub) else this + interval
 
 
 @_convert.register(sge.Interval)
 def convert_interval(interval, scope):
-    unit = _unit(interval.args.get("unit"), _interval_units, interval, scope)
+    unit = _unit(interval.args.get("unit"), interval, scope)
     if isinstance(interval.this, sge.Literal):
         return ibis.interval(_interval_count(interval.this, interval, scope), unit)
     return convert(interval.this, scope=scope).as_interval(unit)
