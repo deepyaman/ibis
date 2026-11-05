@@ -414,3 +414,15 @@ def test_catalog_takes_a_table_expression():
     # the table is named by its catalog key
     sql = ibis.to_sql(expr, dialect="duckdb", pretty=False)
     assert sql == 'SELECT * FROM "t" AS "t0" WHERE "t0"."a" > 1'
+
+
+@pytest.mark.parametrize(
+    "condition", ["b IS NOT NULL", "b NOTNULL", "(a > 1) IS NOT TRUE"]
+)
+def test_negated_is_follows_the_dialect(condition):
+    # sqlglot parses ``IS NOT`` as ``Is(negate=True)`` for postgres from 30.14
+    # and as ``Not(Is)`` for duckdb
+    sql = f"SELECT a FROM t WHERE {condition}"
+    expected = ibis.parse_sql(sql.replace("NOTNULL", "IS NOT NULL"), tables)
+    result = ibis.parse_sql(sql, tables, dialect="postgres")
+    assert ibis.to_sql(result) == ibis.to_sql(expected)
