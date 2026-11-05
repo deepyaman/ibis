@@ -116,6 +116,7 @@ CASES = {
     "correlated_scalar_subquery": "SELECT a FROM t WHERE c > (SELECT AVG(c) FROM t AS t2 WHERE t2.a = t.a)",
     "scalar_subquery": "SELECT a FROM t WHERE c > (SELECT AVG(c) FROM t)",
     "join": "SELECT t.a, u.x FROM t JOIN u ON t.a = u.a",
+    "comma_then_left_join": "SELECT t.a, u.x, v.a AS va FROM t, u LEFT JOIN t AS v ON u.a = v.a",
     "left_join_anti": "SELECT t.a, u.x FROM t LEFT JOIN u ON t.a = u.a WHERE u.x IS NULL",
     "self_join": "SELECT t1.a, t2.b FROM t AS t1 JOIN t AS t2 ON t1.a = t2.a",
     "cross_join": "SELECT t.a, u.x FROM t CROSS JOIN u",
@@ -232,6 +233,14 @@ UNSUPPORTED = {
         "GROUPING SETS",
     ),
     "natural_join": ("SELECT * FROM t NATURAL JOIN u", "NATURAL join"),
+    "comma_then_right_join": (
+        "SELECT t.a, u.x, v.a AS va FROM t, u RIGHT JOIN t AS v ON u.a = v.a",
+        "after a comma",
+    ),
+    "comma_then_full_join": (
+        "SELECT t.a, u.x, v.a AS va FROM t, u FULL JOIN t AS v ON u.a = v.a",
+        "after a comma",
+    ),
     "natural_join_columns": ("SELECT a, b, x FROM t NATURAL JOIN u", "NATURAL join"),
     "asof_join": ("SELECT t.a FROM t ASOF JOIN u ON t.a >= u.a", "ASOF join"),
     "lateral": (
@@ -297,6 +306,10 @@ INVALID = {
     "unknown_column": ("SELECT zzz FROM t", "zzz"),
     "unknown_table": ("SELECT a FROM nope", "nope"),
     "ambiguous_column": ("SELECT a FROM t JOIN u ON t.a = u.a", "'a'"),
+    "comma_then_left_join_on_earlier_table": (
+        "SELECT t.a, u.x, v.a AS va FROM t, u LEFT JOIN t AS v ON v.a = t.a",
+        "before the comma",
+    ),
     "anti_join_right_column": (
         "SELECT t.a, u.a AS ua FROM t ANTI JOIN u ON t.a = u.a",
         "'u'",

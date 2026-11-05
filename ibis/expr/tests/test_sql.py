@@ -205,17 +205,12 @@ def test_comma_join_conditions_become_join_keys():
     assert isinstance(predicate, ops.Greater)
 
 
-def test_comma_join_conditions_stay_filters_before_a_right_join():
+def test_right_join_after_a_comma_join_raises():
+    # ``t, (u RIGHT JOIN v)``: the left-deep chain would build ``(t, u) RIGHT
+    # JOIN v``, which keeps an unmatched row of v once rather than per row of t
     sql = "SELECT t.a FROM t, u RIGHT JOIN v ON u.a = v.a WHERE t.a = u.a"
-    expr = ibis.parse_sql(sql, tables)
-    (chain,) = expr.op().find(ops.JoinChain)
-    first, second = chain.rest
-    assert first.how == "cross"
-    assert not first.predicates
-    assert second.how == "right"
-    (filt,) = expr.op().find(ops.Filter)
-    (predicate,) = filt.predicates
-    assert isinstance(predicate, ops.Equals)
+    with pytest.raises(com.UnsupportedOperationError, match="after a comma"):
+        ibis.parse_sql(sql, tables)
 
 
 def test_dropped_join_key_resolves_after_a_filter():

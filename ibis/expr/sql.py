@@ -374,6 +374,9 @@ def _build_from(select, scope):
     scope.rel = rel
     bound = {alias}
     deferred = []
+    # the tables bound before the latest comma: an explicit JOIN binds
+    # tighter than a comma, so ``FROM a, b JOIN c`` is ``a, (b JOIN c)``
+    before_comma = None
     for i, join in enumerate(joins):
         if (
             join.method
@@ -386,9 +389,21 @@ def _build_from(select, scope):
         ):
             raise _unsupported(join, scope, "This kind of join")
         how = _JOIN_KINDS[join.kind] or _JOIN_SIDES[join.side]
+        on = _conjuncts(join.args.get("on"))
+        if not (join.kind or join.side or on):
+            before_comma = set(bound)
+        elif how != "inner" and before_comma is not None:
+            # the join chain is left-deep, which is ``(a, b) JOIN c``: the
+            # same as ``a, (b JOIN c)`` only for a join that keeps the
+            # left side's rows and whose condition does not refer to ``a``
+            if join.side in ("RIGHT", "FULL"):
+                raise _unsupported(join, scope, "A RIGHT or FULL join after a comma")
+            if any(_tables(condition) & before_comma for condition in on):
+                raise _invalid(
+                    join, scope, "The join condition refers to a table before the comma"
+                )
         alias, right = _bind_source(join.this, scope)
         visible = bound | {alias}
-        on = _conjuncts(join.args.get("on"))
         if (
             not on
             and join.kind in ("", "CROSS")
