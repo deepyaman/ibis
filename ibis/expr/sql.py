@@ -1097,7 +1097,6 @@ def convert_between(between, scope):
 _reduction_methods = {
     sge.Max: "max",
     sge.Min: "min",
-    sge.Quantile: "quantile",
     sge.Sum: "sum",
     sge.Avg: "mean",
     sge.ArrayAgg: "collect",
@@ -1110,6 +1109,11 @@ _reduction_methods = {
 def convert_reduction(reduction, scope):
     if (method := _reduction_methods.get(type(reduction))) is None:
         raise _unsupported(reduction, scope)
+    if reduction.args.get("expressions"):
+        # DuckDB's ``MAX(x, n)`` is the top n values, SQLite's ``MAX(x, y)``
+        # the greater of two values
+        what = f"{reduction.key.upper()} of more than one argument"
+        raise _unsupported(reduction, scope, what)
     this = convert(reduction.this, scope=scope)
     return getattr(this, method)()
 

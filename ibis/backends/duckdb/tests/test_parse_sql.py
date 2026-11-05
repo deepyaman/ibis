@@ -248,6 +248,9 @@ UNSUPPORTED = {
         "GROUPS",
     ),
     "count_distinct_two": ("SELECT COUNT(DISTINCT a, b) FROM t", "COUNT"),
+    "max_min_top_n": ("SELECT MAX(a, 2), MIN(a, 2) FROM t", "MAX"),
+    "min_top_n": ("SELECT MIN(a, 2) FROM t", "MIN"),
+    "quantile": ("SELECT QUANTILE(c, 0.5) FROM t", "QUANTILE"),
     "between_symmetric": (
         "SELECT a FROM t WHERE a BETWEEN SYMMETRIC 2 AND 1",
         "SYMMETRIC",

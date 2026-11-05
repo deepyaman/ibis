@@ -328,3 +328,9 @@ def test_round_with_truncation_is_rejected():
     # a zero third argument rounds
     expr = ibis.parse_sql("SELECT ROUND(c, 1, 0) AS r FROM t", tables, dialect="tsql")
     assert isinstance(expr.op().values["r"], ops.Round)
+
+
+def test_scalar_max_of_two_arguments_is_rejected():
+    # SQLite's MAX of two arguments is the greater of them, not an aggregate
+    with pytest.raises(com.UnsupportedOperationError, match="MAX"):
+        ibis.parse_sql("SELECT MAX(a, c) AS m FROM t", tables, dialect="sqlite")
