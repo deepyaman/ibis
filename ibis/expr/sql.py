@@ -1257,16 +1257,18 @@ def convert_nth_value(func, scope):
     return this.nth(convert(func.args["offset"], scope=scope) - 1)
 
 
-def _window_bound(value, side):
+def _window_bound(value, side, scope):
     """Translate a window frame bound into Ibis's signed offset convention."""
     if value is None:
         return None
-    text = value if isinstance(value, str) else value.name
-    if text.upper() == "UNBOUNDED":
-        return None
-    if text.upper() == "CURRENT ROW":
-        return 0
-    offset = int(text)
+    if isinstance(value, str):
+        if value.upper() == "UNBOUNDED":
+            return None
+        if value.upper() == "CURRENT ROW":
+            return 0
+        raise _unsupported(value, scope, f"The window frame bound {value!r}")
+    # an INTERVAL, a column or any expression: Ibis takes them all as offsets
+    offset = convert(value, scope)
     return -offset if (side or "").upper() == "PRECEDING" else offset
 
 
@@ -1307,12 +1309,14 @@ def convert_window(window, scope):
     if (spec := parts["spec"]) is not None:
         if spec.args.get("exclude"):
             raise _unsupported(window, scope, "A window frame with EXCLUDE")
-        start = _window_bound(spec.args.get("start"), spec.args.get("start_side"))
+        start = _window_bound(
+            spec.args.get("start"), spec.args.get("start_side"), scope
+        )
         if (end := spec.args.get("end")) is None:
             # ``ROWS 1 PRECEDING`` names the start only; the end is the current row
             end = 0
         else:
-            end = _window_bound(end, spec.args.get("end_side"))
+            end = _window_bound(end, spec.args.get("end_side"), scope)
         kind = (spec.args.get("kind") or "ROWS").upper()
         if kind not in ("ROWS", "RANGE"):
             # Ibis's frames count rows or range over values; a GROUPS frame

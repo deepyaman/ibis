@@ -217,6 +217,11 @@ CASES = {
     "mixed_case_catalog_union": "SELECT id FROM employee UNION ALL SELECT ID FROM Employee ORDER BY Id",
     "cast_decimal_precision": "SELECT CAST(c AS DECIMAL(18, 3)) AS x, CAST(c AS DECIMAL(10, 2)) AS y FROM w",
     "cast_timestamp_drops_time_zone": "SELECT CAST(ts AS TIMESTAMP) AS n FROM w",
+    "window_interval_bound": "SELECT a, SUM(c) OVER (ORDER BY d RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW) AS s FROM t",
+    "window_interval_bound_timestamp": "SELECT a, COUNT(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 2 HOUR PRECEDING AND CURRENT ROW) AS n FROM t",
+    "window_column_bound": "SELECT a, SUM(c) OVER (ORDER BY d ROWS BETWEEN a PRECEDING AND CURRENT ROW) AS s FROM t",
+    "window_expression_bound": "SELECT a, SUM(c) OVER (ORDER BY d ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW) AS s FROM t",
+    "window_fractional_bound": "SELECT a, SUM(c) OVER (ORDER BY c RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM t",
 }
 
 UNSUPPORTED = {
