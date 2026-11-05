@@ -1564,6 +1564,12 @@ def convert_count(count, scope):
 
 @_convert.register(sge.In)
 def convert_in(in_, scope):
+    # ``a IN UNNEST(...)`` and ``a IN b`` test membership of an array; with no
+    # ``expressions`` they would otherwise become ``isin([])``, always FALSE
+    if in_.args.get("unnest") is not None:
+        raise _unsupported(in_, scope, "IN UNNEST")
+    if in_.args.get("field") is not None:
+        raise _unsupported(in_, scope, "IN of an array value")
     this = convert(in_.this, scope=scope)
     if (query := in_.args.get("query")) is not None:
         return this.isin(_single_column(query, scope))

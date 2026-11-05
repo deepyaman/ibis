@@ -489,3 +489,18 @@ def test_parse_sql_named_window_cycle():
     sql = "SELECT SUM(id) OVER w1 AS s FROM employee WINDOW w1 AS (w2), w2 AS (w1)"
     with pytest.raises(com.IbisInputError, match="refers to itself"):
         ibis.parse_sql(sql, catalog)
+
+
+@pytest.mark.parametrize("dialect", ["bigquery", None])
+@pytest.mark.parametrize("op", ["IN", "NOT IN"])
+def test_parse_sql_in_unnest_is_unsupported(dialect, op):
+    sql = f"SELECT id FROM employee WHERE id {op} UNNEST([1, 2])"
+    with pytest.raises(com.UnsupportedOperationError, match="(?i)unnest"):
+        ibis.parse_sql(sql, catalog, dialect=dialect)
+
+
+@pytest.mark.parametrize("dialect", ["mysql", None])
+def test_parse_sql_in_field_is_unsupported(dialect):
+    sql = "SELECT id FROM employee WHERE id IN first_name"
+    with pytest.raises(com.UnsupportedOperationError, match="IN of an array"):
+        ibis.parse_sql(sql, catalog, dialect=dialect)

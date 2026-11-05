@@ -303,6 +303,9 @@ UNSUPPORTED = {
     "bitwise_and": ("SELECT a & 1 FROM t", "(?i)bitwise"),
     "parameter": ("SELECT a FROM t WHERE b = $1", "(?i)placeholder"),
     "insert": ("INSERT INTO t VALUES (1)", "(?i)insert"),
+    "in_unnest": ("SELECT a FROM t WHERE a IN UNNEST([1, 2])", "(?i)unnest"),
+    "not_in_unnest": ("SELECT a FROM t WHERE a NOT IN UNNEST([1, 2])", "(?i)unnest"),
+    "in_list_column": ("SELECT a FROM t WHERE a IN b", "(?i)IN of an array"),
 }
 
 # SQL that is invalid, or that Ibis cannot type, raises an input error
