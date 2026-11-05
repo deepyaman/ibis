@@ -147,6 +147,34 @@ roundtrip_cases = {
     "window_negative_following": t.select(
         t.a.sum().over(ibis.window(preceding=5, following=-1, order_by=t.a)).name("s")
     ),
+    "window_negative_preceding_column_following": t.select(
+        t.a.sum().over(ibis.window(preceding=-1, following=t.a, order_by=t.a)).name("s")
+    ),
+    "window_column_preceding_negative_following": t.select(
+        t.a.sum().over(ibis.window(preceding=t.a, following=-1, order_by=t.a)).name("s")
+    ),
+    "window_range_negative_interval_preceding": t.select(
+        t.a.sum()
+        .over(
+            ibis.range_window(
+                preceding=ibis.interval(-1, "D"),
+                following=ibis.interval(2, "D"),
+                order_by=ibis.timestamp("2024-01-01 00:00:00"),
+            )
+        )
+        .name("s")
+    ),
+    "window_range_negative_interval_following": t.select(
+        t.a.sum()
+        .over(
+            ibis.range_window(
+                preceding=ibis.interval(2, "D"),
+                following=ibis.interval(-1, "D"),
+                order_by=ibis.timestamp("2024-01-01 00:00:00"),
+            )
+        )
+        .name("s")
+    ),
     "dummy_table_values": ops.DummyTable(
         {"x": ibis.literal(1).op(), "y": (ibis.literal(2) + 1).op()}
     ).to_expr(),

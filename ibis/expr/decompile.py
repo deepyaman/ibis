@@ -348,8 +348,13 @@ def window_function(op, func, how, start, end, group_by, order_by):
         # two-sided builders keep its side
         builder = "window" if op.how == "rows" else "range_window"
         bounds = [
-            f"{side}={bound.value.value!r}"
-            for side, bound in (("preceding", op.start), ("following", op.end))
+            # a preceding bound renders with a leading minus that the
+            # ``preceding=`` argument already implies
+            f"{side}={value[1:] if bound.preceding else value}"
+            for side, bound, value in (
+                ("preceding", op.start, start),
+                ("following", op.end, end),
+            )
             if bound is not None
         ]
         return f"{func}.over(ibis.{builder}({', '.join([*bounds, *params])}))"
