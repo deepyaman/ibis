@@ -227,6 +227,8 @@ CASES = {
     "union_all_intersect_precedence": "SELECT a FROM t UNION ALL SELECT a FROM u INTERSECT SELECT a FROM u",
     "intersect_chain_precedence": "SELECT a FROM t INTERSECT SELECT a FROM u UNION SELECT a FROM t INTERSECT SELECT a FROM t INTERSECT SELECT a FROM u ORDER BY a LIMIT 3",
     "paren_union_intersect": "(SELECT a FROM t UNION SELECT a FROM u) INTERSECT SELECT a FROM u",
+    "order_by_expression_of_shadowed_column": "SELECT -a AS a FROM t ORDER BY a + 1",
+    "order_by_shadowing_alias": "SELECT -a AS a FROM t ORDER BY a",
 }
 
 UNSUPPORTED = {
@@ -367,6 +369,10 @@ INVALID = {
     "syntax_error": ("SELEC a FROM t", "Cannot parse"),
     "two_statements": ("SELECT a FROM t; SELECT a FROM u", "one statement"),
     "empty": ("", "one statement"),
+    "order_by_expression_of_ungrouped_column": (
+        "SELECT a % 2 AS a, COUNT(*) AS n FROM t GROUP BY 1 ORDER BY a + 1 DESC, n",
+        "GROUP BY",
+    ),
 }
 
 

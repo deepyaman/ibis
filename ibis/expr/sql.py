@@ -574,11 +574,36 @@ def _project(rel, values, elide=True):
     return _finish(rel).select(values)
 
 
+def _input_key(key, scope):
+    """Bind the unqualified columns of a non-bare ORDER BY key to the input.
+
+    ``qualify`` leaves a column unqualified when a SELECT alias has its name;
+    only a bare ``ORDER BY name`` refers to the alias, a column inside an
+    expression (``ORDER BY a + 1``) is the input column.
+    """
+    if isinstance(_unparen(key.this), sge.Column):
+        return key
+    key = key.copy()
+    for column in key.this.find_all(sge.Column):
+        if column.table or column.find_ancestor(sge.Select, sge.Subquery):
+            continue
+        name = _normalize(column.name, scope.root.dialect)
+        aliases = [
+            alias for alias, member in scope.members.items() if name in member.columns
+        ]
+        if len(aliases) != 1:
+            raise _invalid(
+                key, scope, f"Cannot resolve column {column.name!r} in ORDER BY"
+            )
+        column.set("table", sge.to_identifier(aliases[0]))
+    return key
+
+
 def _order_by(order, scope, proj, values, distinct):
     scope.outputs = _keyed(
         {value.get_name(): value for value in values}, scope.root.dialect
     )
-    keys = [convert(key, scope) for key in order.expressions]
+    keys = [convert(_input_key(key, scope), scope) for key in order.expressions]
     try:
         return proj.order_by(keys)
     except com.IntegrityError:
