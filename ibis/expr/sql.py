@@ -72,37 +72,8 @@ def _uppercases(dialect: str | None) -> bool:
 class Catalog(dict[str, ir.Table]):
     """A catalog of tables and their schemas."""
 
-    typemap = {
-        dt.Int8: "tinyint",
-        dt.Int16: "smallint",
-        dt.Int32: "int",
-        dt.Int64: "bigint",
-        dt.Float16: "halffloat",
-        dt.Float32: "float",
-        dt.Float64: "double",
-        dt.Decimal: "decimal",
-        dt.Boolean: "boolean",
-        dt.JSON: "json",
-        dt.Interval: "interval",
-        dt.Timestamp: "datetime",
-        dt.Date: "date",
-        dt.Binary: "varbinary",
-        dt.String: "varchar",
-        dt.Array: "array",
-        dt.Map: "map",
-        dt.UUID: "uuid",
-        dt.Struct: "struct",
-    }
-
-    def to_sqlglot_dtype(self, dtype: dt.DataType) -> str:
-        if dtype.is_geospatial():
-            return dtype.geotype
-        else:
-            default = dtype.__class__.__name__.lower()
-            return self.typemap.get(type(dtype), default)
-
-    def to_sqlglot_schema(self, schema: sch.Schema) -> dict[str, str]:
-        return {name: self.to_sqlglot_dtype(dtype) for name, dtype in schema.items()}
+    def to_sqlglot_schema(self, schema: sch.Schema) -> dict[str, sge.DataType]:
+        return {name: SqlglotType.from_ibis(dtype) for name, dtype in schema.items()}
 
     def to_sqlglot(self):
         return {

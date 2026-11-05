@@ -23,6 +23,7 @@ CATALOG = {
     "t": {"a": "int64", "b": "string", "c": "float64", "d": "date", "ts": "timestamp"},
     "u": {"a": "int64", "x": "string"},
     "Employee": {"Id": "int64", "Name": "string"},
+    "w": {"c": "decimal(10, 2)", "ts": "timestamp('UTC')"},
 }
 
 T_ROWS = """
@@ -45,6 +46,8 @@ def duck():
     con.execute(f"INSERT INTO u {U_ROWS}")
     con.execute("CREATE TABLE Employee (Id BIGINT, Name VARCHAR)")
     con.execute("INSERT INTO Employee VALUES (1, 'ann'), (2, 'bo')")
+    con.execute("CREATE TABLE w (c DECIMAL(10, 2), ts TIMESTAMPTZ)")
+    con.execute("INSERT INTO w VALUES (1.25, TIMESTAMPTZ '2024-01-01 10:00:00+00')")
     return con
 
 
@@ -203,6 +206,8 @@ CASES = {
     "mixed_case_catalog_subquery": "SELECT e.ID, e.name FROM (SELECT id, Name FROM employee) AS e ORDER BY ID DESC",
     "mixed_case_catalog_group_by": "SELECT name, COUNT(*) AS n FROM employee GROUP BY NAME",
     "mixed_case_catalog_union": "SELECT id FROM employee UNION ALL SELECT ID FROM Employee ORDER BY Id",
+    "cast_decimal_precision": "SELECT CAST(c AS DECIMAL(18, 3)) AS x, CAST(c AS DECIMAL(10, 2)) AS y FROM w",
+    "cast_timestamp_drops_time_zone": "SELECT CAST(ts AS TIMESTAMP) AS n FROM w",
 }
 
 UNSUPPORTED = {
