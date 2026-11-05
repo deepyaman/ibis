@@ -822,7 +822,46 @@ def _align_set_operands(left, right):
     return left.select(left_values), right.select(right_values)
 
 
+_SETOP_CLAUSES = ("order", "limit", "offset", "with_", "with")
+
+
+def _reassociate(setop):
+    """Give an unparenthesized INTERSECT its precedence over UNION and EXCEPT.
+
+    sqlglot folds ``a UNION b INTERSECT c`` from the left, into
+    ``(a UNION b) INTERSECT c``; SQL evaluates ``a UNION (b INTERSECT c)``.
+    """
+    left = setop.left
+    if type(left) in _set_operations:
+        left = _reassociate(left)
+    if not (
+        isinstance(setop, sge.Intersect)
+        and isinstance(left, (sge.Union, sge.Except))
+        and not any(left.args.get(arg) for arg in _SETOP_CLAUSES)
+        and not (setop.args.get("by_name") or left.args.get("by_name"))
+    ):
+        if left is not setop.left:
+            setop = setop.copy()
+            setop.set("this", left)
+        return setop
+    inner = sge.Intersect(
+        this=left.right.copy(),
+        expression=setop.right.copy(),
+        distinct=setop.args.get("distinct"),
+    )
+    outer = type(left)(
+        this=left.left.copy(),
+        expression=_reassociate(inner),
+        distinct=left.args.get("distinct"),
+    )
+    for arg in _SETOP_CLAUSES:
+        if (value := setop.args.get(arg)) is not None:
+            outer.set(arg, value.copy())
+    return outer
+
+
 def convert_set_operation(setop, scope):
+    setop = _reassociate(setop)
     _bind_ctes(setop, scope)
     if setop.args.get("by_name"):
         raise _unsupported(setop, scope, "A set operation BY NAME")

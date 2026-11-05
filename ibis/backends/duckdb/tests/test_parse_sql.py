@@ -222,6 +222,11 @@ CASES = {
     "paren_query_limit_derived": "SELECT * FROM ((SELECT a FROM t ORDER BY a DESC) LIMIT 2) AS s",
     "paren_query_limit_cte": "WITH x AS ((SELECT a FROM t ORDER BY a) LIMIT 1) SELECT a FROM x",
     "paren_query_with": "WITH x AS (SELECT a FROM t) (SELECT a FROM x ORDER BY a) LIMIT 1",
+    "union_intersect_precedence": "SELECT a FROM t UNION SELECT a FROM u INTERSECT SELECT a FROM u",
+    "except_intersect_precedence": "SELECT a FROM t EXCEPT SELECT a FROM u INTERSECT SELECT a FROM u",
+    "union_all_intersect_precedence": "SELECT a FROM t UNION ALL SELECT a FROM u INTERSECT SELECT a FROM u",
+    "intersect_chain_precedence": "SELECT a FROM t INTERSECT SELECT a FROM u UNION SELECT a FROM t INTERSECT SELECT a FROM t INTERSECT SELECT a FROM u ORDER BY a LIMIT 3",
+    "paren_union_intersect": "(SELECT a FROM t UNION SELECT a FROM u) INTERSECT SELECT a FROM u",
 }
 
 UNSUPPORTED = {
