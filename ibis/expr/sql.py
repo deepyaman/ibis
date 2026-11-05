@@ -755,6 +755,8 @@ def convert_select(select, scope, *, projection=True, elide=True):
         roots.append(having.this)
     if order is not None:
         roots.extend(key.this for key in order.expressions)
+    # an aggregate in a WINDOW definition is computed by the aggregate too
+    roots.extend(scope.windows.values())
     units = _metric_units(roots, scope)
     if group is not None or units:
         _aggregate(select, scope, units)
