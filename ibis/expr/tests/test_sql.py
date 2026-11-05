@@ -360,3 +360,12 @@ def test_cast_to_another_parameterization_is_kept(dialect):
         'SELECT CAST("t0"."c" AS DECIMAL(18, 3)) AS "x", '
         'CAST("t0"."ts" AS TIMESTAMP) AS "n", "t0"."c" AS "y" FROM "t" AS "t0"'
     )
+
+
+def test_catalog_takes_a_table_expression():
+    other = ibis.table({"a": "int64"}, name="other")
+    expr = ibis.parse_sql("SELECT a FROM t WHERE a > 1", {"t": other})
+    assert expr.schema() == ibis.schema({"a": "int64"})
+    # the table is named by its catalog key
+    sql = ibis.to_sql(expr, dialect="duckdb", pretty=False)
+    assert sql == 'SELECT * FROM "t" AS "t0" WHERE "t0"."a" > 1'

@@ -1714,7 +1714,8 @@ def parse_sql(sqlstring, catalog, dialect=None):
         SQL string to parse
     catalog : dict
         A dictionary mapping table names to either schemas or ibis table expressions.
-        If a schema is passed, a table expression will be created using the schema.
+        If a schema is passed, a table expression will be created using the schema;
+        of a table expression, only the schema is used.
         Catalog names are compared as the dialect compares unquoted identifiers.
     dialect : str, optional
         The SQL dialect to use with sqlglot to parse the query string.
@@ -1733,7 +1734,12 @@ def parse_sql(sqlstring, catalog, dialect=None):
 
     """
     catalog = Catalog(
-        {name: ibis.table(schema, name=name) for name, schema in catalog.items()}
+        {
+            name: ibis.table(
+                schema.schema() if isinstance(schema, ir.Table) else schema, name=name
+            )
+            for name, schema in catalog.items()
+        }
     )
     tables = Catalog(
         {_normalize(name, dialect): table for name, table in catalog.items()}
