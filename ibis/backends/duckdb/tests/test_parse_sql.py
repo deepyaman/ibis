@@ -364,6 +364,16 @@ INVALID = {
     "syntax_error": ("SELEC a FROM t", "Cannot parse"),
     "two_statements": ("SELECT a FROM t; SELECT a FROM u", "one statement"),
     "empty": ("", "one statement"),
+    "first_value_without_over": ("SELECT FIRST_VALUE(a) AS f FROM t", "OVER"),
+    "last_value_without_over": ("SELECT LAST_VALUE(a) AS f FROM t", "OVER"),
+    "first_value_without_over_grouped": ("SELECT a, FIRST_VALUE(c) AS f FROM t GROUP BY a", "OVER"),
+    "lag_without_over": ("SELECT LAG(a) AS l FROM t", "OVER"),
+    "rank_without_over": ("SELECT RANK() AS r FROM t", "OVER"),
+    "dense_rank_without_over": ("SELECT DENSE_RANK() AS r FROM t", "OVER"),
+    "ntile_without_over": ("SELECT NTILE(2) AS r FROM t", "OVER"),
+    "nth_value_without_over": ("SELECT NTH_VALUE(a, 2) AS r FROM t", "OVER"),
+    "row_number_without_over": ("SELECT ROW_NUMBER() AS r FROM t", "OVER"),
+    "row_number_without_over_in_where": ("SELECT a FROM t WHERE ROW_NUMBER() > 1", "OVER"),
 }
 
 

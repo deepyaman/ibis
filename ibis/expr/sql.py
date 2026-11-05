@@ -239,6 +239,33 @@ def _is_window_function(node) -> bool:
     return isinstance(unit.parent, sge.Window) and unit.parent.this is unit
 
 
+# functions SQL allows only as the function of a window; sqlglot makes some of
+# them aggregate functions
+_WINDOW_ONLY = tuple(
+    cls
+    for name in (
+        "RowNumber",
+        "Rank",
+        "DenseRank",
+        "PercentRank",
+        "CumeDist",
+        "Ntile",
+        "Lag",
+        "Lead",
+        "FirstValue",
+        "LastValue",
+        "NthValue",
+    )
+    if (cls := getattr(sge, name, None)) is not None
+)
+
+
+def _require_window(func, scope) -> None:
+    """Reject a window-only function called without OVER."""
+    if not _is_window_function(func):
+        raise _invalid(func, scope, "The function requires an OVER clause")
+
+
 def _unparen(node):
     while isinstance(node, sge.Paren):
         node = node.this
@@ -464,6 +491,8 @@ def _metric_units(roots, scope):
         ):
             if not isinstance(node, sge.AggFunc) or _is_window_function(node):
                 continue
+            if isinstance(node, _WINDOW_ONLY):
+                _require_window(node, scope)
             unit = node.parent if isinstance(node.parent, sge.Filter) else node
             for inner in unit.walk(
                 prune=lambda n: isinstance(n, (sge.Select, sge.Subquery))
@@ -1213,6 +1242,7 @@ def _register(name):
 @_register("PercentRank")
 @_register("CumeDist")
 def convert_ranking(func, scope):
+    _require_window(func, scope)
     name = type(func).__name__
     result = getattr(ibis, _ranking_functions[name])()
     if name in ("RowNumber", "Rank", "DenseRank"):
@@ -1223,6 +1253,7 @@ def convert_ranking(func, scope):
 
 @_register("Ntile")
 def convert_ntile(ntile, scope):
+    _require_window(ntile, scope)
     # SQL's NTILE is 1-based, Ibis's is 0-based
     return ibis.ntile(convert(ntile.this, scope=scope)) + 1
 
@@ -1230,6 +1261,7 @@ def convert_ntile(ntile, scope):
 @_convert.register(sge.Lag)
 @_convert.register(sge.Lead)
 def convert_lag_lead(func, scope):
+    _require_window(func, scope)
     this = convert(func.this, scope=scope)
     offset = func.args.get("offset")
     default = func.args.get("default")
@@ -1242,16 +1274,19 @@ def convert_lag_lead(func, scope):
 
 @_convert.register(sge.FirstValue)
 def convert_first_value(func, scope):
+    _require_window(func, scope)
     return convert(func.this, scope=scope).first()
 
 
 @_convert.register(sge.LastValue)
 def convert_last_value(func, scope):
+    _require_window(func, scope)
     return convert(func.this, scope=scope).last()
 
 
 @_convert.register(sge.NthValue)
 def convert_nth_value(func, scope):
+    _require_window(func, scope)
     this = convert(func.this, scope=scope)
     # SQL's NTH_VALUE is 1-based, ``nth`` is 0-based
     return this.nth(convert(func.args["offset"], scope=scope) - 1)
