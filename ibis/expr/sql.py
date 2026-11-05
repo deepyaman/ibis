@@ -14,6 +14,7 @@ import sqlglot.optimizer as sgo
 from public import public
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.canonicalize import canonicalize
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify import qualify
 
 import ibis
@@ -47,6 +48,25 @@ def _arg(node, *names):
         if (value := node.args.get(name)) is not None:
             return value
     return None
+
+
+def _normalize(name: str, dialect: str | None) -> str:
+    """``name`` as ``dialect`` compares it, as sqlglot normalizes a schema."""
+    return normalize_identifiers(name, dialect=dialect).name
+
+
+def _keyed(columns: dict, dialect: str | None) -> dict:
+    """Key ``columns`` by each name as written and as ``dialect`` compares it."""
+    keyed = dict(columns)
+    for name, value in columns.items():
+        keyed.setdefault(_normalize(name, dialect), value)
+    return keyed
+
+
+def _uppercases(dialect: str | None) -> bool:
+    """Whether ``dialect`` upper-cases unquoted identifiers (Snowflake, Oracle)."""
+    strategy = sg.Dialect.get_or_raise(dialect).normalization_strategy
+    return strategy.name.endswith("UPPERCASE")
 
 
 class Catalog(dict[str, ir.Table]):
@@ -94,6 +114,7 @@ class Catalog(dict[str, ir.Table]):
 class _Root:
     """State shared by every scope of a query."""
 
+    # keyed by the table names as the dialect compares them
     catalog: Catalog
     dialect: str | None
     # relations scanned so far; scanning one again yields a distinct ``.view()``
@@ -106,6 +127,8 @@ class _Member:
 
     table: ir.Table
     columns: dict[str, str]
+    # a column name in the SQL -> the column's name in the bound table
+    names: dict[str, str]
 
 
 @dataclass
@@ -151,7 +174,17 @@ class Scope:
         return None
 
     def bind(self, alias: str, table: ir.Table) -> None:
-        self.members[alias] = _Member(table, dict(zip(table.columns, table.columns)))
+        names = _keyed(dict(zip(table.columns, table.columns)), self.root.dialect)
+        self.members[alias] = _Member(table, dict(names), names)
+
+    def source_name(self, alias: str, name: str) -> str | None:
+        """The name of the column ``alias.name`` in the table ``alias`` binds."""
+        scope = self
+        while scope is not None:
+            if (member := scope.members.get(alias)) is not None:
+                return member.names.get(name)
+            scope = scope.parent
+        return None
 
     def rebind(self, rel: ir.Table) -> None:
         """Continue building from ``rel``, which keeps the column names."""
@@ -178,6 +211,10 @@ class Scope:
         if self.parent is not None:
             return self.parent.column(alias, name)
         raise com.IbisInputError(f"Unknown table or alias {alias!r}")
+
+
+# marks the aliases the SQL wrote, as opposed to those ``qualify`` adds
+_WRITTEN = "ibis_written_alias"
 
 
 def _unsupported(node, scope, what=None):
@@ -328,7 +365,7 @@ def _hoistable(condition, visible, alias) -> bool:
     )
 
 
-def _map_member(member, right, rel) -> None:
+def _map_member(member, right, rel, dialect) -> None:
     """Address the columns of a joined table through the join chain's output."""
     columns = {}
     source = right.op()
@@ -344,7 +381,7 @@ def _map_member(member, right, rel) -> None:
         # an inner join key is not repeated in the output when it is equal to
         # the same-named column of the left side: it is that column
         columns.setdefault(name, name)
-    member.columns = columns
+    member.columns = _keyed(columns, dialect)
 
 
 def _build_from(select, scope):
@@ -403,7 +440,7 @@ def _build_from(select, scope):
             rel = rel.cross_join(right, rname=rname)
         else:
             rel = rel.join(right, how=how, rname=rname)
-        _map_member(scope.members[alias], right, rel)
+        _map_member(scope.members[alias], right, rel, scope.root.dialect)
         scope.rebind(rel)
         bound = visible
     return rel, deferred + where
@@ -566,7 +603,9 @@ def _project(rel, values, elide=True):
 
 
 def _order_by(order, scope, proj, values, distinct):
-    scope.outputs = {value.get_name(): value for value in values}
+    scope.outputs = _keyed(
+        {value.get_name(): value for value in values}, scope.root.dialect
+    )
     keys = [convert(key, scope) for key in order.expressions]
     try:
         return proj.order_by(keys)
@@ -705,7 +744,7 @@ def convert_select(select, scope, *, projection=True, elide=True):
         )
 
     items = [
-        (item.this if isinstance(item, sge.Alias) else item, item.alias_or_name)
+        (item.this if isinstance(item, sge.Alias) else item, _output_name(item, scope))
         for item in select.expressions
     ]
     having = select.args.get("having")
@@ -737,6 +776,23 @@ def convert_select(select, scope, *, projection=True, elide=True):
     if order is not None:
         rel = _order_by(order, scope, rel, values, distinct)
     return _limit(select, rel, scope)
+
+
+def _output_name(item, scope):
+    """The name of a SELECT-list item.
+
+    ``qualify`` names an unaliased column by its normalized name; a dialect
+    that does not upper-case names reports the name the table gives it.
+    """
+    if (
+        isinstance(item, sge.Alias)
+        and not item.meta.get(_WRITTEN)
+        and isinstance(column := item.this, sge.Column)
+        and not _uppercases(scope.root.dialect)
+        and (name := scope.source_name(column.table, column.name)) is not None
+    ):
+        return name
+    return item.alias_or_name
 
 
 def _convert_from_less(select, scope):
@@ -805,7 +861,9 @@ def convert_set_operation(setop, scope):
     if (order := setop.args.get("order")) is not None:
         keys = scope.child()
         keys.rel = table
-        keys.outputs = {name: table[name] for name in table.columns}
+        keys.outputs = _keyed(
+            {name: table[name] for name in table.columns}, scope.root.dialect
+        )
         table = table.order_by([convert(key, keys) for key in order.expressions])
     return _limit(setop, table, scope)
 
@@ -1686,6 +1744,7 @@ def parse_sql(sqlstring, catalog, dialect=None):
     catalog : dict
         A dictionary mapping table names to either schemas or ibis table expressions.
         If a schema is passed, a table expression will be created using the schema.
+        Catalog names are compared as the dialect compares unquoted identifiers.
     dialect : str, optional
         The SQL dialect to use with sqlglot to parse the query string.
 
@@ -1705,6 +1764,9 @@ def parse_sql(sqlstring, catalog, dialect=None):
     catalog = Catalog(
         {name: ibis.table(schema, name=name) for name, schema in catalog.items()}
     )
+    tables = Catalog(
+        {_normalize(name, dialect): table for name, table in catalog.items()}
+    )
 
     try:
         statements = [s for s in sg.parse(sqlstring, dialect) if s is not None]
@@ -1715,11 +1777,19 @@ def parse_sql(sqlstring, catalog, dialect=None):
             f"parse_sql takes one statement, {len(statements)} were given"
         )
     (expr,) = statements
-    scope = Scope(_Root(catalog, dialect))
-    known = set(catalog) | {cte.alias for cte in expr.find_all(sge.CTE)}
+    scope = Scope(_Root(tables, dialect))
+    known = set(tables) | {
+        normalize_identifiers(cte.args["alias"].this.copy(), dialect).name
+        for cte in expr.find_all(sge.CTE)
+    }
     for table in expr.find_all(sge.Table):
-        if isinstance(table.this, sge.Identifier) and table.name not in known:
+        if (
+            isinstance(table.this, sge.Identifier)
+            and normalize_identifiers(table.this.copy(), dialect).name not in known
+        ):
             raise com.IbisInputError(f"Table {table.name!r} is not in the catalog")
+    for alias in expr.find_all(sge.Alias):
+        alias.meta[_WRITTEN] = True
     for join in expr.find_all(sge.Join):
         if join.method:
             # qualify cannot resolve the columns of these joins; say why first

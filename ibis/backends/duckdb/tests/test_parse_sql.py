@@ -22,6 +22,7 @@ from ibis.tests.util import (
 CATALOG = {
     "t": {"a": "int64", "b": "string", "c": "float64", "d": "date", "ts": "timestamp"},
     "u": {"a": "int64", "x": "string"},
+    "Employee": {"Id": "int64", "Name": "string"},
 }
 
 T_ROWS = """
@@ -42,6 +43,8 @@ def duck():
     con.execute("CREATE TABLE u (a BIGINT, x VARCHAR)")
     con.execute(f"INSERT INTO t {T_ROWS}")
     con.execute(f"INSERT INTO u {U_ROWS}")
+    con.execute("CREATE TABLE Employee (Id BIGINT, Name VARCHAR)")
+    con.execute("INSERT INTO Employee VALUES (1, 'ann'), (2, 'bo')")
     return con
 
 
@@ -191,6 +194,15 @@ CASES = {
     "nested_exists": "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t.a AND EXISTS (SELECT 1 FROM t AS t2 WHERE t2.a = t.a AND t2.c > 2))",
     "nullif_interval": "SELECT NULLIF(b, 'foo') AS n, d + INTERVAL (a) DAY AS dd FROM t",
     "exists_uncorrelated_rescan": "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM t AS t2)",
+    "upper_case_table": "SELECT T.a, X.b FROM T JOIN T AS X ON T.a = x.A WHERE T.A > 1",
+    "upper_case_cte": "WITH X AS (SELECT A FROM t) SELECT a FROM x WHERE A > 1",
+    "quoted_mixed_case_alias": 'SELECT "Tt".a AS "MixedCase", "Tt".b AS "b B" FROM t AS "Tt"',
+    "mixed_case_catalog": "SELECT id, NAME AS n FROM employee",
+    "mixed_case_catalog_spellings": 'SELECT Id FROM Employee WHERE ID > 1 AND "Id" < 3',
+    "mixed_case_catalog_star": "SELECT * FROM EMPLOYEE ORDER BY id",
+    "mixed_case_catalog_subquery": "SELECT e.ID, e.name FROM (SELECT id, Name FROM employee) AS e ORDER BY ID DESC",
+    "mixed_case_catalog_group_by": "SELECT name, COUNT(*) AS n FROM employee GROUP BY NAME",
+    "mixed_case_catalog_union": "SELECT id FROM employee UNION ALL SELECT ID FROM Employee ORDER BY Id",
 }
 
 UNSUPPORTED = {
@@ -395,6 +407,19 @@ def test_decompile_roundtrip_matches_duckdb(duck, sql):
     """Parsed SQL decompiles to Python that rebuilds an equivalent expression."""
     expr = decompile_roundtrip(ibis.parse_sql(sql, CATALOG, dialect="duckdb"))
     assert_matches_duckdb(duck, expr, sql)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [name for name in CASES if name.startswith(("upper_case", "mixed_case"))],
+    ids=lambda name: name,
+)
+def test_parse_sql_names_columns_as_duckdb_does(duck, name):
+    # the comparator ignores the case of names; an unaliased column takes the
+    # case the catalog gives it, as DuckDB names it
+    sql = CASES[name]
+    expr = ibis.parse_sql(sql, CATALOG, dialect="duckdb")
+    assert expr.columns == tuple(duck.execute(sql).fetch_arrow_table().column_names)
 
 
 @pytest.mark.parametrize(("sql", "message"), _params(UNSUPPORTED))
